@@ -123,7 +123,7 @@ class OpenTrade:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MomentumTrader:
-    def __init__(self):
+    def __init__(self, api_key: str = None, api_secret: str = None, tele_token: str = None, tele_chat: str = None):
         self.open_trades: dict[str, OpenTrade] = {}  # pair -> OpenTrade
         self.trade_history: list[dict] = []
         self.total_profit = 0.0
@@ -137,25 +137,37 @@ class MomentumTrader:
         self.global_cooldown_until: float = 0.0
         self.last_market_health_check: float = 0.0
         
-        with open(CONFIG_FILE) as f:
-            config = json.load(f)
+        self.api_key = api_key
+        self.api_secret = api_secret
+        
+        config = {}
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE) as f:
+                    config = json.load(f)
+            except Exception:
+                pass
+
         tele_conf = config.get("telegram", {})
+        final_token = tele_token or tele_conf.get("token", "")
+        final_chat = tele_chat or tele_conf.get("chat_id", "")
+        
         self.notifier = TelegramNotifier(
-            token=tele_conf.get("token", ""),
-            chat_id=tele_conf.get("chat_id", ""),
-            enabled=tele_conf.get("enabled", False)
+            token=final_token,
+            chat_id=final_chat,
+            enabled=bool(final_token and final_chat) or tele_conf.get("enabled", False)
         )
         
-        self.exchange = self._init_exchange()
+        self.exchange = self._init_exchange(config)
 
-    def _init_exchange(self) -> ccxt.kraken:
+    def _init_exchange(self, config: dict) -> ccxt.kraken:
         try:
-            with open(CONFIG_FILE) as f:
-                config = json.load(f)
+            kr_key = self.api_key or config.get("exchange", {}).get("key", "")
+            kr_sec = self.api_secret or config.get("exchange", {}).get("secret", "")
 
             exchange = ccxt.kraken({
-                "apiKey": config["exchange"]["key"],
-                "secret": config["exchange"]["secret"],
+                "apiKey": kr_key,
+                "secret": kr_sec,
                 "enableRateLimit": True,
                 "rateLimit": 3000,
                 "nonce": lambda: int(time.time() * 1000000),
