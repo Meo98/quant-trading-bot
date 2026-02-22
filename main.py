@@ -116,7 +116,11 @@ def main(page: ft.Page):
     )
 
     pin_view = ft.Column(
-        [pin_icon, pin_title, pin_input, pin_error, pin_submit_btn],
+        [pin_icon, pin_title, pin_input, pin_error, pin_submit_btn,
+         ft.Text(
+             "💡 Tip: Enable your phone's App Lock for fingerprint/face unlock!",
+             color=ft.Colors.GREY_600, size=11, text_align=ft.TextAlign.CENTER,
+         )],
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         alignment=ft.MainAxisAlignment.CENTER,
         spacing=15,

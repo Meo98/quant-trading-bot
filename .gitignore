@@ -17,6 +17,10 @@ secrets.json
 # Data & Logs
 data/
 *.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+user_data/
 
 # Mobile Build Artifacts
 .buildozer/
