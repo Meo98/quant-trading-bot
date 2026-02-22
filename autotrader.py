@@ -784,7 +784,7 @@ class MomentumTrader:
                         pair, pct, vol, price, vola = pumps[0]
                         if time.time() > self.pump_cooldowns.get(pair + "_radar", 0):
                             log.info(f"  🚨 PUMP RADAR: {pair} +{pct:.1f}% (Slots fully in use!)")
-                            self.notifier.send(f"🚨 <b>PUMP RADAR</b>\nCoin <b>{pair}</b> is pumping <b>+{pct:.1f}%</b>!\n<i>Slots are full, ignoring.</i>")
+                            # self.notifier.send(f"🚨 <b>PUMP RADAR</b>\nCoin <b>{pair}</b> is pumping <b>+{pct:.1f}%</b>!\n<i>Slots are full, ignoring.</i>")
                             self.pump_cooldowns[pair + "_radar"] = time.time() + (15 * 60)
 
                 # Status

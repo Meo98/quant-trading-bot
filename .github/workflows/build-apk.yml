@@ -30,7 +30,7 @@ jobs:
       - name: Build APK with Flet
         run: |
           yes | flutter doctor --android-licenses
-          yes | flet build apk --module-name mobile.flet_app
+          yes | flet build apk
           
       - name: Upload APK
         uses: actions/upload-artifact@v4
