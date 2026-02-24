@@ -42,6 +42,12 @@ TRAILING_STOP_PCT = 0.10      # Verkaufe wenn Preis 10% vom Höchststand fällt 
 HARD_STOP_LOSS_PCT = -0.15    # -15% absoluter Stop-Loss (Notbremse)
 MIN_PROFIT_TO_EXIT = 0.025    # Mind. 2.5% Profit bevor Trailing Stop greift
 
+# ── Dynamic Trailing Stop (Step-Up) ─────────────────────────────────────────
+STEP_UP_1_PROFIT = 0.20       # Wenn Trade > +20% Profit hat...
+STEP_UP_1_TRAILING = 0.15     # ...erweitere Trailing Stop auf 15% (Coin darf mehr atmen)
+STEP_UP_2_PROFIT = 0.50       # Wenn Trade > +50% Profit hat (Moon-Phase)...
+STEP_UP_2_TRAILING = 0.25     # ...erweitere Trailing Stop auf 25% (für die massiven 200%+ Runs)
+
 # ── Pump-Tracking (erkennt NEUE Pumps vs. alte) ────────────────────────────
 PUMP_COOLDOWN_MIN = 30        # Gleichen Coin frühestens nach 30 Min nochmal kaufen
 
@@ -139,6 +145,7 @@ class MomentumTrader:
         self.market_is_toxic: bool = False
         self.global_cooldown_until: float = 0.0
         self.last_market_health_check: float = 0.0
+        self.last_telegram_summary: float = 0.0  # Phase 11: Hourly Summary Timer
         
         self.api_key = api_key
         self.api_secret = api_secret
@@ -530,11 +537,26 @@ class MomentumTrader:
         if profit <= trade.hard_sl_pct:
             return f"🛑 STOP-LOSS ({profit*100:.1f}% / SL: {trade.hard_sl_pct*100:.1f}%)"
 
-        # 2. Trailing Stop – nur wenn wir schon etwas Profit haben
+        # 2. Dynamic Trailing Stop (Step-Up)
         if profit > MIN_PROFIT_TO_EXIT:
+            # Berechne den dynamischen Stop basierend auf dem aktuellen Höchststand (Profit am Peak)
+            peak_profit = trade.profit_pct(trade.highest_price)
+            
+            # Wähle den passenden Trailing Stop für diese Profit-Stufe
+            active_trailing_stop = trade.trailing_stop_pct  # Standard (z.B. 10%)
+            
+            if peak_profit >= STEP_UP_2_PROFIT:
+                active_trailing_stop = max(trade.trailing_stop_pct, STEP_UP_2_TRAILING) # z.B. 25%
+            elif peak_profit >= STEP_UP_1_PROFIT:
+                active_trailing_stop = max(trade.trailing_stop_pct, STEP_UP_1_TRAILING) # z.B. 15%
+
             drawdown = trade.drawdown_from_high(current_price)
-            if drawdown <= -trade.trailing_stop_pct:
-                return (f"📉 TRAILING STOP | Peak: {trade.highest_price:.6f} → "
+            if drawdown <= -active_trailing_stop:
+                stufe = ""
+                if active_trailing_stop == STEP_UP_2_TRAILING: stufe = " [MOON-PHASE 25%]"
+                elif active_trailing_stop == STEP_UP_1_TRAILING: stufe = " [STEP-UP 15%]"
+                
+                return (f"📉 TRAILING STOP{stufe} | Peak: {trade.highest_price:.6f} → "
                         f"Now: {current_price:.6f} ({drawdown*100:.1f}% vom High)")
 
         return None
@@ -669,6 +691,13 @@ class MomentumTrader:
             log.info(f"  🔴 SELL {trade.pair} | {profit_pct*100:+.2f}% (€{profit_eur:+.2f}) | {reason} [DRY]")
             self.eur_balance = trade.stake_eur + profit_eur
             self.total_profit += profit_eur
+            
+            # Telegram Notifier (Clean & Concise)
+            self.notifier.send(f"🔴 <b>DRY SELL: {pair}</b>\n"
+                               f"<b>P/L:</b> {profit_pct*100:+.2f}% (€{profit_eur:+.2f})\n"
+                               f"<b>Reason:</b> {reason}\n"
+                               f"<b>Duration:</b> {trade.time_in_trade_min():.0f} min\n"
+                               f"<b>Balance:</b> €{self.eur_balance:.2f}")
         else:
             try:
                 # KRITISCHER BEFEHL: Wenn es eine offenen Kraken Stop-Loss gibt, müssen wir den abbrechen, 
@@ -706,8 +735,12 @@ class MomentumTrader:
                 self._refresh_balance()
                 self.total_profit += profit_eur
                 
-                emoji = "🔥" if profit_pct > 0 else "🛑"
-                self.notifier.send(f"{emoji} <b>SELL</b> {trade.pair}\nProfit: <b>{profit_pct*100:+.2f}%</b> (€{profit_eur:+.2f})\nReason: <i>{reason}</i>")
+                # Telegram Notifier (Clean & Concise)
+                self.notifier.send(f"🔴 <b>SELL: {pair}</b>\n"
+                                   f"<b>P/L:</b> {profit_pct*100:+.2f}% (€{profit_eur:+.2f})\n"
+                                   f"<b>Reason:</b> {reason}\n"
+                                   f"<b>Duration:</b> {trade.time_in_trade_min():.0f} min\n"
+                                   f"<b>Balance:</b> €{self.eur_balance:.2f}")
 
             except Exception as e:
                 log.error(f"  ❌ SELL FAILED {trade.pair}: {e}")
@@ -883,14 +916,38 @@ class MomentumTrader:
                                 log.info(f"  🚀 PUMP: {new_pair} +{new_pct:.1f}% | REALLOCATION KAUF!")
                                 self.execute_buy(new_pair, new_price, new_vola)
                                 
-                        # 3. Radar Fallback (Wenn keine Reallocation stattfand und Slots voll sind)
+                        # 3. Radar Fallback (Kein Telegram Spam mehr)
                         elif pumps[0][1] >= 15.0:  
                             pair, pct, vol, price, vola = pumps[0]
                             if time.time() > self.pump_cooldowns.get(pair + "_radar", 0):
                                 log.info(f"  🚨 PUMP RADAR: {pair} +{pct:.1f}% (Slots fully in use!)")
+                                # Radar Sends no telegram directly anymore to prevent spam. Handled in hourly summary.
                                 self.pump_cooldowns[pair + "_radar"] = time.time() + (15 * 60)
 
-                # Status
+                # Phase 11: Hourly Telegram Summary
+                if now - self.last_telegram_summary > 3600:
+                    self.last_telegram_summary = now
+                    if len(self.trade_history) >= 0: # Only send if alive
+                        wins = sum(1 for t in self.trade_history if t["profit_eur"] > 0)
+                        losses = len(self.trade_history) - wins
+                        
+                        open_pos_text = ""
+                        for pair, trade in self.open_trades.items():
+                            curr_p = self.get_current_price(pair)
+                            if curr_p:
+                                prof = trade.profit_pct(curr_p) * 100
+                                open_pos_text += f"• {pair}: {prof:+.1f}% ({trade.time_in_trade_min():.0f}m)\n"
+                        if not open_pos_text:
+                            open_pos_text = "Keine aktiven Trades."
+                            
+                        self.notifier.send(f"📊 <b>HOURLY SUMMARY</b>\n"
+                                           f"<b>P/L Session:</b> €{self.total_profit:+.2f}\n"
+                                           f"<b>Win/Loss:</b> {wins}W / {losses}L\n"
+                                           f"<b>Balance:</b> €{self.eur_balance:.2f}\n"
+                                           f"<b>Open Slots:</b> {MAX_OPEN_TRADES - len(self.open_trades)}/{MAX_OPEN_TRADES}\n\n"
+                                           f"<b>Active Trades:</b>\n{open_pos_text}")
+
+                # Status Console
                 if self.trade_history and cycle % 10 == 0:
                     wins = sum(1 for t in self.trade_history if t["profit_eur"] > 0)
                     log.info(f"  📊 {wins}W/{len(self.trade_history)-wins}L | €{self.total_profit:+.2f}")
