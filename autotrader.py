@@ -31,6 +31,8 @@ MAX_OPEN_TRADES = 3       # Wie viele Coins dürfen parallel gehandelt werden?
 # ── Pump-Erkennung ──────────────────────────────────────────────────────────
 # Ein Coin wird als "Pump" erkannt wenn er diese Kriterien erfüllt:
 PUMP_MIN_PCT_24H = 5.0        # Mind. +5% in 24h
+PUMP_MIN_PCT_15M = 1.0        # Mind. +1.0% in letzten 15 Minuten (vermeidet alte Pumps)
+PUMP_MIN_PCT_1H  = 2.0        # ODER Alternativ: +2.0% in letzter 1 Stunde
 PUMP_MIN_VOLUME_EUR = 10000   # Mind. €10k 24h-Volumen (filtert Scam-Coins)
 PUMP_MIN_PRICE = 0.0001       # Mindestpreis in EUR
 PUMP_MAX_ALREADY_PUMPED = 200 # Ignoriere Coins die schon >200% gestiegen sind (zu spät)
@@ -131,6 +133,7 @@ class MomentumTrader:
         self.all_eur_pairs: list[str] = []
         self.pump_cooldowns: dict[str, float] = {}  # pair → timestamp
         self.prev_tickers: dict[str, float] = {}    # pair → last_price (für Trend)
+        self.price_history: dict[str, list[tuple[float, float]]] = {}  # pair → [(timestamp, price)] (2h Historie)
         
         # Phase 3 Circuit Breaker States
         self.market_is_toxic: bool = False
@@ -429,6 +432,14 @@ class MomentumTrader:
             # Volumen in EUR
             vol_eur = quote_vol if quote_vol > 0 else (base_vol * price)
 
+            # --- Phase 10: Rolling Price History (2 Hours) ---
+            if symbol not in self.price_history:
+                self.price_history[symbol] = []
+            self.price_history[symbol].append((now, price))
+            
+            # Speicher bereinigen: Nur die letzten 7200 Sekunden (2 Stunden) behalten
+            self.price_history[symbol] = [(t, p) for (t, p) in self.price_history[symbol] if now - t <= 7200]
+
             # Filter anwenden
             if price < PUMP_MIN_PRICE:
                 continue
@@ -448,6 +459,34 @@ class MomentumTrader:
             prev_price = self.prev_tickers.get(symbol, 0)
             if prev_price > 0 and price < prev_price:
                 continue  # Preis fällt gerade → kein Entry
+
+            # --- Phase 10: Short-Term Momentum Filter ---
+            history = self.price_history[symbol]
+            price_15m_ago = None
+            price_1h_ago = None
+            
+            # Suche die passenden historischen Preise (history ist chronologisch sortiert)
+            for t, p in history:
+                if now - t <= 900 and price_15m_ago is None:
+                    price_15m_ago = p    # Ältester Preis innerhalb der letzten 15 Min
+                if now - t <= 3600 and price_1h_ago is None:
+                    price_1h_ago = p     # Ältester Preis innerhalb der letzten 1 Std
+                    
+            if not price_15m_ago: price_15m_ago = price
+            if not price_1h_ago: price_1h_ago = price
+            
+            pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago > 0 else 0.0
+            pct_1h = (price - price_1h_ago) / price_1h_ago * 100 if price_1h_ago > 0 else 0.0
+            
+            # Kriterium 1: Coin darf nicht gerade stark fallen (-0.5% in 15m)
+            if pct_15m < -0.5:
+                continue
+                
+            # Kriterium 2: Der Pump muss aktuell sein (nicht von gestern Nacht).
+            # Wir fordern entweder frische +1% in 15m ODER beständige +2% in 1h.
+            # (Wenn der Bot neu startet, ist der Speicher leer -> er kauft erst, wenn er den Pump "live" sieht!)
+            if pct_15m < PUMP_MIN_PCT_15M and pct_1h < PUMP_MIN_PCT_1H:
+                continue
 
             # Volatility ermitteln (high / low var)
             high_24h = ticker.get("high", 0) or 0
@@ -710,7 +749,7 @@ class MomentumTrader:
         log.info(f"  🚀 Momentum Trader gestartet [{mode}]")
         log.info(f"  📊 {len(self.all_eur_pairs)} EUR-Pairs | Alle {CHECK_INTERVAL}s")
         log.info(f"  💰 Balance: €{self.eur_balance:.2f} ({MAX_OPEN_TRADES} Slots verfügbar)")
-        log.info(f"  📈 Pump-Erkennung: >{PUMP_MIN_PCT_24H}% | Vol >€{PUMP_MIN_VOLUME_EUR}")
+        log.info(f"  📈 Pump-Erkennung: >{PUMP_MIN_PCT_24H}% (24h) & Frisches Momentum (15m/1h) | Vol >€{PUMP_MIN_VOLUME_EUR}")
         log.info(f"  📉 Trailing Stop: {TRAILING_STOP_PCT*100}% | Hard SL: {HARD_STOP_LOSS_PCT*100}%")
         log.info("═" * 60)
         
