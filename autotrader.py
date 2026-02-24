@@ -20,7 +20,7 @@ from pathlib import Path
 #  KONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-DRY_RUN = False           # True = Simulation, False = Echtes Trading!
+DRY_RUN = False               # Wenn True: Keine echten Orders auf Kraken (nur Ledger/Log)
 CONFIG_FILE = Path(__file__).parent / "config.json"
 
 # Timing & Sizing
@@ -819,24 +819,76 @@ class MomentumTrader:
 
                 pumps = self.detect_pumps()
 
-                if pumps and len(self.open_trades) < MAX_OPEN_TRADES:
-                    # Top 3 anzeigen
-                    for p, pc, v, pr, vola in pumps[:3]:
-                        log.info(f"     {'🚀' if p == pumps[0][0] else '  '} {p}: +{pc:.1f}% (€{v:,.0f} | V: {vola*100:.1f}%)")
+                if pumps:
+                    # Top 3 anzeigen (nur alle 5 Zyklen)
+                    if cycle % 5 == 1 or cycle == 1:
+                        for p, pc, v, pr, vola in pumps[:3]:
+                            log.info(f"     {'🚀' if p == pumps[0][0] else '  '} {p}: +{pc:.1f}% (€{v:,.0f} | V: {vola*100:.1f}%)")
 
-                    # Versuche Pumps der Reihe nach zu kaufen
-                    for pair, pct, vol, price, vola in pumps[:5]:
-                        log.info(f"  🚀 PUMP: {pair} +{pct:.1f}% | Vol: €{vol:,.0f} | Kaufe!")
-                        success = self.execute_buy(pair, price, vola)
-                        if success and len(self.open_trades) >= MAX_OPEN_TRADES:
-                            break  # Alle Slots voll
-                elif pumps and len(self.open_trades) >= MAX_OPEN_TRADES:
-                    if pumps[0][1] >= 15.0:  # 15% pump threshold for radar
-                        pair, pct, vol, price, vola = pumps[0]
-                        if time.time() > self.pump_cooldowns.get(pair + "_radar", 0):
-                            log.info(f"  🚨 PUMP RADAR: {pair} +{pct:.1f}% (Slots fully in use!)")
-                            # self.notifier.send(f"🚨 <b>PUMP RADAR</b>\nCoin <b>{pair}</b> is pumping <b>+{pct:.1f}%</b>!\n<i>Slots are full, ignoring.</i>")
-                            self.pump_cooldowns[pair + "_radar"] = time.time() + (15 * 60)
+                    # 1. Normale Käufe (Wenn noch freie Slots da sind)
+                    if len(self.open_trades) < MAX_OPEN_TRADES:
+                        for pair, pct, vol, price, vola in pumps[:5]:
+                            if pair in self.open_trades: continue
+                            log.info(f"  🚀 PUMP: {pair} +{pct:.1f}% | Vol: €{vol:,.0f} | Kaufe!")
+                            success = self.execute_buy(pair, price, vola)
+                            if success and len(self.open_trades) >= MAX_OPEN_TRADES:
+                                break  # Alle Slots voll
+                                
+                    # 2. Opportunity Cost Reallocation (Wenn Slots voll sind)
+                    elif len(self.open_trades) >= MAX_OPEN_TRADES:
+                        worst_stagnant_pair = None
+                        worst_stagnant_profit = 999.0
+                        
+                        # Suche den "schlechtesten" stagnierenden Trade
+                        for pair, trade in self.open_trades.items():
+                            mins_running = trade.time_in_trade_min()
+                            current_price = self.get_current_price(pair)
+                            if not current_price: continue
+                            
+                            profit = trade.profit_pct(current_price) * 100
+                            
+                            if mins_running >= STAGNATION_MINUTES and profit < STAGNATION_MAX_PROFIT_PCT:
+                                if profit < worst_stagnant_profit:
+                                    worst_stagnant_profit = profit
+                                    worst_stagnant_pair = pair
+                                    
+                        # Wenn wir einen Todeskandidaten gefunden haben
+                        if worst_stagnant_pair:
+                            best_new_pump = None
+                            for pair, pct, vol, price, vola in pumps:
+                                if pair not in self.open_trades:
+                                    # pumps ist nach stärkstem Momentum sortiert
+                                    best_new_pump = (pair, pct, price, vola)
+                                    break
+                                    
+                            if best_new_pump:
+                                new_pair, new_pct, new_price, new_vola = best_new_pump
+                                mins_running = self.open_trades[worst_stagnant_pair].time_in_trade_min()
+                                
+                                log.warning(f"  🔄 REALLOCATION: Opfere stagnierenden {worst_stagnant_pair} "
+                                            f"({worst_stagnant_profit:+.1f}%, {mins_running:.0f}min) "
+                                            f"für starken neuen Pump {new_pair} ({new_pct:+.1f}%)")
+                                            
+                                self.notifier.send(f"🔄 <b>REALLOCATION</b>\n"
+                                                  f"Opfere <b>{worst_stagnant_pair}</b> ({worst_stagnant_profit:+.1f}% nach {mins_running:.0f}m)\n"
+                                                  f"für frischen Pump <b>{new_pair}</b> ({new_pct:+.1f}%)")
+                                
+                                # Verkaufe den lahmen Trade
+                                current_price_stagnant = self.get_current_price(worst_stagnant_pair)
+                                self.execute_sell(worst_stagnant_pair, f"Reallocated to {new_pair}", current_price_stagnant)
+                                
+                                time.sleep(1.5) # Kraken Guthaben Synch
+                                
+                                # Kaufe den frischen Pump
+                                log.info(f"  🚀 PUMP: {new_pair} +{new_pct:.1f}% | REALLOCATION KAUF!")
+                                self.execute_buy(new_pair, new_price, new_vola)
+                                
+                        # 3. Radar Fallback (Wenn keine Reallocation stattfand und Slots voll sind)
+                        elif pumps[0][1] >= 15.0:  
+                            pair, pct, vol, price, vola = pumps[0]
+                            if time.time() > self.pump_cooldowns.get(pair + "_radar", 0):
+                                log.info(f"  🚨 PUMP RADAR: {pair} +{pct:.1f}% (Slots fully in use!)")
+                                self.pump_cooldowns[pair + "_radar"] = time.time() + (15 * 60)
 
                 # Status
                 if self.trade_history and cycle % 10 == 0:
