@@ -37,3 +37,4 @@ bin/
 ehthumbs.db
 Thumbs.db
 .app_secrets.json
+build/

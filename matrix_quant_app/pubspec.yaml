@@ -38,6 +38,7 @@ dependencies:
   rust_lib_matrix_quant_app:
     path: rust_builder
   local_auth: ^3.0.0
+  flutter_background_service: ^5.1.0
 
 dev_dependencies:
   flutter_test:
