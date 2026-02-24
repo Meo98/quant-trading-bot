@@ -1,2 +1,6 @@
 pub mod api;
-mod frb_generated;
+pub mod config;
+pub mod trading;
+
+pub use config::BotConfig;
+pub use trading::engine::TradingEngine;
