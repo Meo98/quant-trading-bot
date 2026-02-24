@@ -4,11 +4,23 @@ import logging
 import json
 import os
 import time
-import ccxt
+import hashlib
+import hmac
+import base64
+import urllib.parse
 from pathlib import Path
 
-import autotrader
-from autotrader import MomentumTrader, TelegramNotifier
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import autotrader
+    from autotrader import MomentumTrader, TelegramNotifier
+    HAS_AUTOTRADER = True
+except ImportError:
+    HAS_AUTOTRADER = False
 
 # Secure local storage file (sits next to the app, excluded by .gitignore)
 SECRETS_FILE = Path(__file__).parent / ".app_secrets.json"
@@ -253,43 +265,66 @@ def main(page: ft.Page):
         portfolio_status.value = "⏳ Fetching from Kraken..."
         page.update()
 
+        def _kraken_private(api_key, api_secret, endpoint, data=None):
+            """Call Kraken private API using requests + HMAC."""
+            url = f"https://api.kraken.com{endpoint}"
+            if data is None:
+                data = {}
+            data["nonce"] = str(int(time.time() * 1000))
+            postdata = urllib.parse.urlencode(data)
+            encoded = (str(data["nonce"]) + postdata).encode()
+            message = endpoint.encode() + hashlib.sha256(encoded).digest()
+            sig = hmac.new(base64.b64decode(api_secret), message, hashlib.sha512)
+            headers = {
+                "API-Key": api_key,
+                "API-Sign": base64.b64encode(sig.digest()).decode(),
+            }
+            return requests.post(url, headers=headers, data=data, timeout=15).json()
+
         def _fetch():
             try:
-                exchange = ccxt.kraken({
-                    'apiKey': k_key, 'secret': k_sec,
-                    'enableRateLimit': True,
-                })
-                balance = exchange.fetch_balance()
+                # Get balance via Kraken REST API
+                bal_resp = _kraken_private(k_key, k_sec, "/0/private/Balance")
+                if bal_resp.get("error") and bal_resp["error"]:
+                    raise Exception(bal_resp["error"][0])
 
+                balances = bal_resp.get("result", {})
                 total_eur = 0.0
                 holdings = []
 
-                for currency, amount_info in balance.get("total", {}).items():
-                    amount = float(amount_info) if amount_info else 0.0
+                # Map Kraken's internal names to readable symbols
+                name_map = {"ZEUR": "EUR", "ZUSD": "USD", "XXBT": "BTC", "XETH": "ETH",
+                            "XXRP": "XRP", "XXLM": "XLM", "XLTC": "LTC", "XXDG": "DOGE"}
+
+                for kraken_name, amount_str in balances.items():
+                    amount = float(amount_str)
                     if amount < 0.0001:
                         continue
+                    symbol = name_map.get(kraken_name, kraken_name)
 
-                    if currency in ("EUR", "ZEUR"):
+                    if symbol == "EUR":
                         total_eur += amount
                         holdings.append(("EUR", amount, amount, 0.0))
-                    elif currency in ("USD", "ZUSD", "USDT", "USDC"):
-                        holdings.append((currency, amount, amount * 0.92, 0.0))
+                    elif symbol in ("USD", "USDT", "USDC"):
+                        holdings.append((symbol, amount, amount * 0.92, 0.0))
                         total_eur += amount * 0.92
                     else:
-                        # Try to get EUR price
-                        pair = f"{currency}/EUR"
+                        # Get EUR price via public ticker
                         try:
-                            ticker = exchange.fetch_ticker(pair)
-                            price = ticker.get("last", 0) or 0
-                            value_eur = amount * price
-                            pct = ticker.get("percentage", 0) or 0
-                            if value_eur > 0.01:
-                                total_eur += value_eur
-                                holdings.append((currency, amount, value_eur, pct))
+                            pair = f"{kraken_name}ZEUR"
+                            t_resp = requests.get(f"https://api.kraken.com/0/public/Ticker?pair={pair}", timeout=10).json()
+                            if not t_resp.get("error") or not t_resp["error"]:
+                                for _, t_data in t_resp.get("result", {}).items():
+                                    price = float(t_data["c"][0])  # last trade price
+                                    pct = float(t_data["p"][1]) if "p" in t_data else 0  # VWAP not pct, use 0
+                                    value_eur = amount * price
+                                    if value_eur > 0.01:
+                                        total_eur += value_eur
+                                        holdings.append((symbol, amount, value_eur, 0.0))
+                                    break
                         except Exception:
                             pass
 
-                # Sort by value descending
                 holdings.sort(key=lambda x: x[2], reverse=True)
 
                 portfolio_balance.value = f"€{total_eur:,.2f}"
@@ -458,6 +493,10 @@ def main(page: ft.Page):
     status_text = ft.Text("Status: Idle", color=ft.Colors.GREY_400)
 
     def run_bot(k_key, k_sec, t_tok, t_chat):
+        if not HAS_AUTOTRADER:
+            log_view.controls.append(ft.Text("❌ Bot engine not available on this platform. Use Desktop version to trade.", color=ft.Colors.RED))
+            page.update()
+            return
         try:
             strat = _get_strategy()
             autotrader.MAX_OPEN_TRADES = int(strat.get("max_open_trades", 3))
