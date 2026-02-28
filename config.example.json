@@ -1,0 +1,17 @@
+{
+  "max_open_trades": 3,
+  "stake_currency": "EUR",
+  "stake_amount": 30,
+  "tradable_balance_ratio": 0.90,
+  "dry_run": true,
+  "exchange": {
+    "name": "kraken",
+    "key": "YOUR_KRAKEN_API_KEY",
+    "secret": "YOUR_KRAKEN_API_SECRET"
+  },
+  "telegram": {
+    "enabled": false,
+    "token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID"
+  }
+}

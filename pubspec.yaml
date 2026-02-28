@@ -31,14 +31,23 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
+  # UI Components
   cupertino_icons: ^1.0.8
+
+  # Rust Integration
   flutter_rust_bridge: 2.11.1
   rust_lib_matrix_quant_app:
     path: rust_builder
+
+  # Security & Authentication
   local_auth: ^3.0.0
+  flutter_secure_storage: ^9.2.0
+
+  # Background Service
   flutter_background_service: ^5.1.0
+
+  # Notifications
+  flutter_local_notifications: ^18.0.0
 
 dev_dependencies:
   flutter_test:

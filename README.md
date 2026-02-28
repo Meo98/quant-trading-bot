@@ -1,36 +1,217 @@
-# Matrix Quant System ⚡
+# Matrix Quant - Cryptocurrency Momentum Trading Bot
 
-Welcome to the **Matrix Quant System**. This repository contains the completely overhauled trading engine designed for maximum efficiency, zero battery drain on mobile, and 24/7 standalone background execution.
+A high-performance cryptocurrency trading bot built with **Rust** and **Flutter**, designed for automated momentum trading on Kraken.
 
-## 🏗 Architecture
-The system has evolved from its Python roots into a high-performance native stack:
-- **Rust Engine (`rust/`)**: The core logic has been rewritten in Rust for absolute memory safety and blistering speed. It handles all Kraken API interactions, pump detection, volatility-based dynamic stops, and circuit breakers.
-- **Flutter App (`lib/`)**: A cross-platform mobile frontend with a stunning Glassmorphism UI. It connects to the Rust engine seamlessly via `flutter_rust_bridge`.
-- **Background Daemon**: The app utilizes an Android Foreground Service to spawn a detached isolate. When you close the app, the Rust engine continues monitoring the markets 24/7 and keeps you updated via a persistent Android notification.
-- **Biometric Security**: Access to the app is secured via FaceID/Fingerprint authentication so that only you can control the quant engine.
+## Features
 
-## 🚀 Getting Started
+- **Pump Detection** - Identifies coins in early uptrends based on 24h/15m/1h momentum
+- **Dynamic Trailing Stop** - Step-up trailing stops that widen as profits grow
+- **Volatility Regime Selection** - Adjusts stop-loss levels based on coin volatility
+- **Mobile-First** - Native Android/iOS apps with background trading
+- **Biometric Security** - FaceID/Fingerprint authentication
+- **Secure Storage** - API credentials encrypted on device
 
-### 1. Build the Mobile App (Android/iOS)
-You can clone this repository to your machine and build the app using Flutter:
-```bash
-# Get the dependencies
-flutter pub get
+## Architecture
 
-# Build the Android APK
-flutter build apk --release
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Flutter Mobile App                       │
+│                    (lib/main.dart)                          │
+│  • Glassmorphism UI                                         │
+│  • Biometric Auth                                           │
+│  • Background Service                                       │
+└────────────────────────┬────────────────────────────────────┘
+                         │ flutter_rust_bridge
+┌────────────────────────▼────────────────────────────────────┐
+│                   Rust Core Engine                          │
+│                   (rust/src/)                               │
+│  • TradingEngine - Main trading loop                        │
+│  • KrakenRestClient - API with HMAC-SHA512                  │
+│  • Pump Detection & Exit Logic                              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Standalone Linux Daemon (Optional)
-If you want to run the Rust engine purely on a Linux server/workstation without the Flutter UI, a CLI daemon entrypoint is available:
+## Project Structure
+
+```
+trading-bot/
+├── rust/                      # Rust trading engine
+│   └── src/
+│       ├── api/
+│       │   ├── rest_client.rs # Kraken API client
+│       │   └── simple.rs      # Flutter bridge functions
+│       ├── trading/
+│       │   ├── engine.rs      # Core trading logic
+│       │   └── mod.rs         # OpenTrade struct
+│       ├── config/mod.rs      # BotConfig
+│       ├── lib.rs             # Library exports
+│       └── main.rs            # Standalone daemon
+├── lib/                       # Flutter app
+│   └── main.dart              # Mobile UI
+├── android/                   # Android platform
+├── ios/                       # iOS platform
+├── legacy_python_bot/         # Original Python implementation
+│   ├── autotrader.py          # Python trading engine
+│   ├── backtester.py          # Historical backtesting
+│   └── dashboard.py           # Web dashboard
+└── data/                      # Historical candle data
+```
+
+## Trading Strategy
+
+### Entry Criteria (Pump Detection)
+
+| Filter | Default | Description |
+|--------|---------|-------------|
+| Min 24h Change | 5% | Minimum pump to consider |
+| Max 24h Change | 200% | Skip if already mooned |
+| Min 15m Change | 1% | Short-term momentum |
+| Min 1h Change | 2% | Medium-term momentum |
+| Min Volume | €10,000 | Liquidity filter |
+| Trend Filter | - | Skip falling prices |
+| Cooldown | 30 min | After exit, wait before re-entry |
+
+### Exit Logic (Trailing Stop)
+
+```
+Hard Stop-Loss: -15% (emergency exit)
+
+Trailing Stop (dynamic):
+  Base:       10% from peak
+  At +20%:    15% from peak (STEP-UP)
+  At +50%:    25% from peak (MOON-PHASE)
+
+Volatility Adjustment:
+  High (>40%):   15% trailing, -20% hard SL
+  Medium (>15%): 10% trailing, -15% hard SL
+  Low:            6% trailing, -10% hard SL
+```
+
+## Installation
+
+### Prerequisites
+
+- Rust 1.70+
+- Flutter 3.10+
+- Android SDK (for APK)
+- Kraken API credentials
+
+### Build Mobile App (Android)
+
+```bash
+# Install dependencies
+flutter pub get
+
+# Generate Rust bindings
+flutter_rust_bridge_codegen generate
+
+# Build APK
+flutter build apk --release
+
+# APK location: build/app/outputs/flutter-apk/app-release.apk
+```
+
+### Run Standalone Daemon (Linux/macOS)
+
 ```bash
 cd rust
 cargo build --release
+./target/release/matrix-quant-core
 ```
-You can map this binary to a `systemd` service for fully automated background execution.
 
-## 🏺 Legacy Python System
-The original `autotrader.py` and Flask dashboard have been deprecated in favor of this new highly-efficient native architecture. All original Python scripts are preserved in the `legacy_python_bot/` directory for reference and backtesting purposes.
+## Configuration
+
+Create `config.json` in the project root:
+
+```json
+{
+  "max_open_trades": 3,
+  "exchange": {
+    "name": "kraken",
+    "key": "YOUR_API_KEY",
+    "secret": "YOUR_API_SECRET"
+  },
+  "dry_run": false
+}
+```
+
+> **Security Note:** Never commit `config.json` to version control. It's in `.gitignore` by default.
+
+### Mobile App Configuration
+
+API credentials are entered in the Settings screen and stored encrypted using Flutter Secure Storage (Android Keystore / iOS Keychain).
+
+## Security
+
+### Credential Storage
+
+| Platform | Method |
+|----------|--------|
+| Android | EncryptedSharedPreferences (AES-256) |
+| iOS | Keychain Services |
+| Desktop | config.json (user responsibility) |
+
+### API Permissions Required
+
+On Kraken, create an API key with these permissions only:
+- Query Funds
+- Query Open Orders & Trades
+- Create & Modify Orders
+
+**Do NOT enable:**
+- Withdraw Funds
+- Query Ledger Entries
+
+### App Permissions (Android)
+
+```xml
+<uses-permission android:name="android.permission.INTERNET"/>
+<uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+<uses-permission android:name="android.permission.WAKE_LOCK"/>
+```
+
+## Risk Warning
+
+**This software is for educational purposes only.**
+
+- Cryptocurrency trading involves substantial risk of loss
+- Past performance does not guarantee future results
+- Never trade with money you cannot afford to lose
+- The developers are not responsible for any financial losses
+
+## Development
+
+### Running Tests
+
+```bash
+# Rust tests
+cd rust && cargo test
+
+# Flutter tests
+flutter test
+```
+
+### Code Generation
+
+After modifying Rust bridge functions:
+
+```bash
+flutter_rust_bridge_codegen generate
+```
+
+## License
+
+MIT License - See [LICENSE](LICENSE) for details.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
 ---
-*Built for efficiency. Engineered for momentum.*
+
+Built with Rust + Flutter

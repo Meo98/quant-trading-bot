@@ -1,20 +1,10 @@
+//! API module - Kraken REST API client and Flutter bridge
+//!
+//! This module contains:
+//! - `rest_client` - Low-level Kraken API with HMAC signing
+//! - `simple` - Flutter bridge functions
+
 pub mod rest_client;
+pub mod simple;
 
-use reqwest::Client;
-use serde_json::Value;
-
-pub struct KrakenApi {
-    pub client: Client,
-    pub api_key: String,
-    pub api_secret: String,
-}
-
-impl KrakenApi {
-    pub fn new(api_key: String, api_secret: String) -> Self {
-        Self {
-            client: Client::new(),
-            api_key,
-            api_secret,
-        }
-    }
-}
+pub use rest_client::KrakenRestClient;
