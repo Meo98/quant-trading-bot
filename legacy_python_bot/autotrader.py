@@ -277,12 +277,31 @@ class MomentumTrader:
                     continue
 
                 try:
-                    order = self.exchange.create_market_sell_order(pair, amount)
+                    # Sicherstellen dass keine offenen Orders den Verkauf blockieren
+                    try:
+                        self.exchange.cancel_all_orders(pair)
+                    except Exception:
+                        pass
+
+                    # Frische Balance holen für diesen Coin
+                    bal = self.exchange.fetch_balance()
+                    free_amt = float(bal.get("free", {}).get(coin, 0))
+                    
+                    if free_amt <= 0:
+                        continue
+
+                    # 0.01% Puffer und Präzision
+                    amt_to_sell = float(self.exchange.amount_to_precision(pair, free_amt * 0.9999))
+                    
+                    if amt_to_sell <= 0:
+                        continue
+
+                    order = self.exchange.create_market_sell_order(pair, amt_to_sell)
                     sell_price = order.get("average") or order.get("price") or price
-                    log.info(f"     🔄 VERKAUFT {pair}: {amount:.6f} → ~€{value:.2f}")
+                    log.info(f"     🔄 VERKAUFT {pair}: {amt_to_sell:.6f} → ~€{value:.2f}")
                     time.sleep(2)
                 except Exception as e:
-                    log.warning(f"     ⚠️  Konnte {pair} nicht verkaufen: {e}")
+                    log.warning(f"     ⚠️  Konnte {pair} nicht verkaufen (Free: {free_amt if 'free_amt' in locals() else '?'}): {e}")
 
         except Exception as e:
             log.warning(f"  ⚠️  Holdings-Check fehlgeschlagen: {e}")
@@ -710,18 +729,23 @@ class MomentumTrader:
                         log.warning(f"  ⚠️  Fehler beim Canceln der SL Order (wurde evtl. schon von Kraken ausgelöst): {cancel_err}")
 
                 # KRITISCHER FIX: Hole das tatsächliche Guthaben des Coins
-                # Kraken zieht Gebühren vom gekauften Coin ab. Wenn wir trade.amount nutzen, schlägt die Order fehl!
+                # Nutze einen winzigen Puffer (0.01%) und die korrekte Kraken-Präzision um "Insufficient funds" zu vermeiden
                 base_coin = trade.pair.split('/')[0]
+                self._refresh_balance() # Sicherstellen dass wir frische Daten haben
                 balance = self.exchange.fetch_balance()
-                actual_amount_to_sell = float(balance.get("free", {}).get(base_coin, 0))
+                free_balance = float(balance.get("free", {}).get(base_coin, 0))
+                
+                # Wir nehmen 99.99% des Guthabens (0.01% Puffer) und runden auf Kraken-Format
+                raw_amount = free_balance * 0.9999
+                actual_amount_to_sell = float(self.exchange.amount_to_precision(trade.pair, raw_amount))
 
                 if actual_amount_to_sell <= 0:
-                     log.error(f"  ❌ SELL FAILED {trade.pair}: Kein Guthaben von {base_coin} gefunden!")
+                     log.error(f"  ❌ SELL FAILED {trade.pair}: Kein ausreichendes Guthaben von {base_coin} gefunden (Free: {free_balance})!")
                      self.notifier.send(f"❌ <b>SELL FAILED</b> {trade.pair}\nKein Guthaben von {base_coin} gefunden!")
                      self.open_trades.pop(pair, None) # Positions-Deadlock auflösen
                      return
 
-                log.info(f"  🔄 Vorbereiten SELL für {trade.pair}: Versuche {actual_amount_to_sell:.6f} {base_coin} zu verkaufen (Erwartet: {trade.amount:.6f})")
+                log.info(f"  🔄 Vorbereiten SELL für {trade.pair}: Versuche {actual_amount_to_sell:.6f} {base_coin} zu verkaufen (Verfügbar: {free_balance:.6f})")
 
                 order = self.exchange.create_market_sell_order(trade.pair, actual_amount_to_sell)
                 actual_price = order.get("average") or order.get("price") or current_price

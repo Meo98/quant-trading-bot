@@ -41,6 +41,7 @@ pub struct EngineStatus {
 }
 
 /// Main trading engine that coordinates all trading activities
+#[derive(Clone)]
 pub struct TradingEngine {
     pub config: BotConfig,
     pub api: KrakenRestClient,

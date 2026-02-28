@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as Base64};
 use hmac::{Hmac, Mac};
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const API_URL: &str = "https://api.kraken.com";
 
+#[derive(Clone)]
 pub struct KrakenRestClient {
     client: Client,
     api_key: String,
