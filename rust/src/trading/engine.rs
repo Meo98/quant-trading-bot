@@ -420,7 +420,7 @@ impl TradingEngine {
         let amount = stake / candidate.price;
 
         // Dynamic regime-based stops
-        let (trailing, hard_sl) = if candidate.volatility > 0.40 {
+        let (trailing, hard_sl): (f64, f64) = if candidate.volatility > 0.40 {
             (0.15, -0.20) // Hyper-volatile memecoin
         } else if candidate.volatility > 0.15 {
             (0.10, -0.15) // Volatile altcoin

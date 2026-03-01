@@ -5,7 +5,6 @@
 
 use crate::config::BotConfig;
 use crate::trading::engine::TradingEngine;
-use crate::trading::TradeInfo;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
