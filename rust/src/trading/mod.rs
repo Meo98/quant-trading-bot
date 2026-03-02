@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Represents an open/active trading position
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[flutter_rust_bridge::frb(ignore)]
 pub struct OpenTrade {
     /// Display name (e.g., "BTC/EUR")
     pub pair: String,
@@ -76,6 +77,7 @@ impl OpenTrade {
 
 /// Trade information for Flutter UI display
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[flutter_rust_bridge::frb(ignore)]
 pub struct TradeInfo {
     pub pair: String,
     pub entry_price: f64,

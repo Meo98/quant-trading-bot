@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[flutter_rust_bridge::frb(ignore)]
 pub struct BotConfig {
     pub api_key: String,
     pub api_secret: String,

@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
@@ -43,12 +44,14 @@
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:foregroundServiceType="dataSync"
-            android:exported="false"/>
+            android:exported="false"
+            tools:replace="android:exported"/>
 
         <!-- Boot Receiver to restart service after reboot -->
         <receiver
             android:name="id.flutter.flutter_background_service.BootReceiver"
-            android:exported="false">
+            android:exported="false"
+            tools:replace="android:exported">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
             </intent-filter>

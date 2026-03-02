@@ -323,7 +323,8 @@ class _AuthScreenState extends State<AuthScreen> {
 
       final success = await auth.authenticate(
         localizedReason: 'Authentifizieren um Matrix Quant zu öffnen',
-        options: const AuthenticationOptions(stickyAuth: true, biometricOnly: false),
+        biometricOnly: false,
+        persistAcrossBackgrounding: true,
       );
 
       if (success) _navigate();
@@ -987,9 +988,9 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
         apiKey: _apiKeyCtrl.text,
         apiSecret: _apiSecretCtrl.text,
         maxOpenTrades: _maxTrades,
-        minPct24h: _minPct24h,
-        minPct15m: _minPct15m,
-        minPct1h: _minPct1h,
+        minPct24H: _minPct24h,
+        minPct15M: _minPct15m,
+        minPct1H: _minPct1h,
         minVolumeEur: _minVolume,
         trailingStopPct: _trailingStop,
         hardSlPct: -_hardStopLoss,

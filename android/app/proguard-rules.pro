@@ -29,6 +29,11 @@
 -keepattributes Signature
 -keepattributes *Annotation*
 
+# Google Play Core (deferred components)
+-dontwarn com.google.android.play.core.splitcompat.SplitCompatApplication
+-dontwarn com.google.android.play.core.splitinstall.**
+-dontwarn com.google.android.play.core.tasks.**
+
 # Remove logging in release
 -assumenosideeffects class android.util.Log {
     public static *** d(...);

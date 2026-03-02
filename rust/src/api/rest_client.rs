@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const API_URL: &str = "https://api.kraken.com";
 
 #[derive(Clone)]
-pub struct KrakenRestClient {
+#[flutter_rust_bridge::frb(ignore)]
+pub(crate) struct KrakenRestClient {
     client: Client,
     api_key: String,
     api_secret: String,

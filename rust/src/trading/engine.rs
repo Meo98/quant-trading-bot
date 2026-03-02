@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Represents a coin that passed pump detection filters
 #[derive(Debug, Clone)]
+#[flutter_rust_bridge::frb(ignore)]
 pub struct PumpCandidate {
     pub pair: String,
     pub kraken_pair: String, // e.g., "XXBTZEUR" for API calls
@@ -30,6 +31,7 @@ pub struct PumpCandidate {
 
 /// Engine status for Flutter UI
 #[derive(Debug, Clone)]
+#[flutter_rust_bridge::frb(ignore)]
 pub struct EngineStatus {
     pub is_running: bool,
     pub eur_balance: f64,
@@ -42,6 +44,7 @@ pub struct EngineStatus {
 
 /// Main trading engine that coordinates all trading activities
 #[derive(Clone)]
+#[flutter_rust_bridge::frb(ignore)]
 pub struct TradingEngine {
     pub config: BotConfig,
     pub api: KrakenRestClient,

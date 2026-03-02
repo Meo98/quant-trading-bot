@@ -4,7 +4,5 @@
 //! - `rest_client` - Low-level Kraken API with HMAC signing
 //! - `simple` - Flutter bridge functions
 
-pub mod rest_client;
+pub(crate) mod rest_client;
 pub mod simple;
-
-pub use rest_client::KrakenRestClient;

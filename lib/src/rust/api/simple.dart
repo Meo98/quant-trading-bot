@@ -6,5 +6,183 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`
+
+/// Simple greeting function (for testing bridge connection)
 String greet({required String name}) =>
     RustLib.instance.api.crateApiSimpleGreet(name: name);
+
+/// Initialize the trading engine with configuration
+Future<String> initializeEngine({required ConfigDto config}) =>
+    RustLib.instance.api.crateApiSimpleInitializeEngine(config: config);
+
+/// Start the trading engine (must be initialized first)
+Future<String> startEngine() =>
+    RustLib.instance.api.crateApiSimpleStartEngine();
+
+/// Stop the trading engine
+String stopEngine() => RustLib.instance.api.crateApiSimpleStopEngine();
+
+/// Run a single trading tick (called by background service)
+Future<String> runTick() => RustLib.instance.api.crateApiSimpleRunTick();
+
+/// Get current engine status
+EngineStatusDto getStatus() => RustLib.instance.api.crateApiSimpleGetStatus();
+
+/// Get list of open trades
+List<TradeDto> getOpenTrades() =>
+    RustLib.instance.api.crateApiSimpleGetOpenTrades();
+
+/// Check if engine is initialized
+bool isInitialized() => RustLib.instance.api.crateApiSimpleIsInitialized();
+
+/// Update engine configuration (requires restart)
+String updateConfig({required ConfigDto config}) =>
+    RustLib.instance.api.crateApiSimpleUpdateConfig(config: config);
+
+/// Get current configuration
+ConfigDto getConfig() => RustLib.instance.api.crateApiSimpleGetConfig();
+
+/// Configuration DTO for Flutter
+class ConfigDto {
+  final String apiKey;
+  final String apiSecret;
+  final int maxOpenTrades;
+  final double minPct24H;
+  final double minPct15M;
+  final double minPct1H;
+  final double minVolumeEur;
+  final double trailingStopPct;
+  final double hardSlPct;
+
+  const ConfigDto({
+    required this.apiKey,
+    required this.apiSecret,
+    required this.maxOpenTrades,
+    required this.minPct24H,
+    required this.minPct15M,
+    required this.minPct1H,
+    required this.minVolumeEur,
+    required this.trailingStopPct,
+    required this.hardSlPct,
+  });
+
+  @override
+  int get hashCode =>
+      apiKey.hashCode ^
+      apiSecret.hashCode ^
+      maxOpenTrades.hashCode ^
+      minPct24H.hashCode ^
+      minPct15M.hashCode ^
+      minPct1H.hashCode ^
+      minVolumeEur.hashCode ^
+      trailingStopPct.hashCode ^
+      hardSlPct.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ConfigDto &&
+          runtimeType == other.runtimeType &&
+          apiKey == other.apiKey &&
+          apiSecret == other.apiSecret &&
+          maxOpenTrades == other.maxOpenTrades &&
+          minPct24H == other.minPct24H &&
+          minPct15M == other.minPct15M &&
+          minPct1H == other.minPct1H &&
+          minVolumeEur == other.minVolumeEur &&
+          trailingStopPct == other.trailingStopPct &&
+          hardSlPct == other.hardSlPct;
+}
+
+/// Engine status for Flutter UI
+class EngineStatusDto {
+  final bool isRunning;
+  final double eurBalance;
+  final int openTradesCount;
+  final int totalPairs;
+  final PlatformInt64 lastTick;
+  final String errorMessage;
+
+  const EngineStatusDto({
+    required this.isRunning,
+    required this.eurBalance,
+    required this.openTradesCount,
+    required this.totalPairs,
+    required this.lastTick,
+    required this.errorMessage,
+  });
+
+  @override
+  int get hashCode =>
+      isRunning.hashCode ^
+      eurBalance.hashCode ^
+      openTradesCount.hashCode ^
+      totalPairs.hashCode ^
+      lastTick.hashCode ^
+      errorMessage.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EngineStatusDto &&
+          runtimeType == other.runtimeType &&
+          isRunning == other.isRunning &&
+          eurBalance == other.eurBalance &&
+          openTradesCount == other.openTradesCount &&
+          totalPairs == other.totalPairs &&
+          lastTick == other.lastTick &&
+          errorMessage == other.errorMessage;
+}
+
+/// Trade info DTO for Flutter
+class TradeDto {
+  final String pair;
+  final double entryPrice;
+  final double currentPrice;
+  final double amount;
+  final double stakeEur;
+  final double profitPct;
+  final double profitEur;
+  final PlatformInt64 timeInTradeMin;
+  final double trailingStopPct;
+
+  const TradeDto({
+    required this.pair,
+    required this.entryPrice,
+    required this.currentPrice,
+    required this.amount,
+    required this.stakeEur,
+    required this.profitPct,
+    required this.profitEur,
+    required this.timeInTradeMin,
+    required this.trailingStopPct,
+  });
+
+  @override
+  int get hashCode =>
+      pair.hashCode ^
+      entryPrice.hashCode ^
+      currentPrice.hashCode ^
+      amount.hashCode ^
+      stakeEur.hashCode ^
+      profitPct.hashCode ^
+      profitEur.hashCode ^
+      timeInTradeMin.hashCode ^
+      trailingStopPct.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TradeDto &&
+          runtimeType == other.runtimeType &&
+          pair == other.pair &&
+          entryPrice == other.entryPrice &&
+          currentPrice == other.currentPrice &&
+          amount == other.amount &&
+          stakeEur == other.stakeEur &&
+          profitPct == other.profitPct &&
+          profitEur == other.profitEur &&
+          timeInTradeMin == other.timeInTradeMin &&
+          trailingStopPct == other.trailingStopPct;
+}

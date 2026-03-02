@@ -66,20 +66,38 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => -1918914929;
+  int get rustContentHash => 1960190468;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
-        stem: 'rust_lib_matrix_quant_app',
+        stem: 'matrix_quant_core',
         ioDirectory: 'rust/target/release/',
         webPrefix: 'pkg/',
       );
 }
 
 abstract class RustLibApi extends BaseApi {
+  ConfigDto crateApiSimpleGetConfig();
+
+  List<TradeDto> crateApiSimpleGetOpenTrades();
+
+  EngineStatusDto crateApiSimpleGetStatus();
+
   String crateApiSimpleGreet({required String name});
 
   Future<void> crateApiSimpleInitApp();
+
+  Future<String> crateApiSimpleInitializeEngine({required ConfigDto config});
+
+  bool crateApiSimpleIsInitialized();
+
+  Future<String> crateApiSimpleRunTick();
+
+  Future<String> crateApiSimpleStartEngine();
+
+  String crateApiSimpleStopEngine();
+
+  String crateApiSimpleUpdateConfig({required ConfigDto config});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -91,13 +109,79 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
+  ConfigDto crateApiSimpleGetConfig() {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 1)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_config_dto,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleGetConfigConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleGetConfigConstMeta =>
+      const TaskConstMeta(debugName: "get_config", argNames: []);
+
+  @override
+  List<TradeDto> crateApiSimpleGetOpenTrades() {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 2)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_list_trade_dto,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleGetOpenTradesConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleGetOpenTradesConstMeta =>
+      const TaskConstMeta(debugName: "get_open_trades", argNames: []);
+
+  @override
+  EngineStatusDto crateApiSimpleGetStatus() {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 3)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_engine_status_dto,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleGetStatusConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleGetStatusConstMeta =>
+      const TaskConstMeta(debugName: "get_status", argNames: []);
+
+  @override
   String crateApiSimpleGreet({required String name}) {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(name, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 1)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -122,7 +206,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 2,
+            funcId: 5,
             port: port_,
           );
         },
@@ -140,6 +224,155 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSimpleInitAppConstMeta =>
       const TaskConstMeta(debugName: "init_app", argNames: []);
 
+  @override
+  Future<String> crateApiSimpleInitializeEngine({required ConfigDto config}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_box_autoadd_config_dto(config, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleInitializeEngineConstMeta,
+        argValues: [config],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleInitializeEngineConstMeta =>
+      const TaskConstMeta(debugName: "initialize_engine", argNames: ["config"]);
+
+  @override
+  bool crateApiSimpleIsInitialized() {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 7)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSimpleIsInitializedConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleIsInitializedConstMeta =>
+      const TaskConstMeta(debugName: "is_initialized", argNames: []);
+
+  @override
+  Future<String> crateApiSimpleRunTick() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleRunTickConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleRunTickConstMeta =>
+      const TaskConstMeta(debugName: "run_tick", argNames: []);
+
+  @override
+  Future<String> crateApiSimpleStartEngine() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 9,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleStartEngineConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleStartEngineConstMeta =>
+      const TaskConstMeta(debugName: "start_engine", argNames: []);
+
+  @override
+  String crateApiSimpleStopEngine() {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleStopEngineConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleStopEngineConstMeta =>
+      const TaskConstMeta(debugName: "stop_engine", argNames: []);
+
+  @override
+  String crateApiSimpleUpdateConfig({required ConfigDto config}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_box_autoadd_config_dto(config, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleUpdateConfigConstMeta,
+        argValues: [config],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleUpdateConfigConstMeta =>
+      const TaskConstMeta(debugName: "update_config", argNames: ["config"]);
+
   @protected
   String dco_decode_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -147,9 +380,99 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  bool dco_decode_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as bool;
+  }
+
+  @protected
+  ConfigDto dco_decode_box_autoadd_config_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_config_dto(raw);
+  }
+
+  @protected
+  ConfigDto dco_decode_config_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
+    return ConfigDto(
+      apiKey: dco_decode_String(arr[0]),
+      apiSecret: dco_decode_String(arr[1]),
+      maxOpenTrades: dco_decode_i_32(arr[2]),
+      minPct24H: dco_decode_f_64(arr[3]),
+      minPct15M: dco_decode_f_64(arr[4]),
+      minPct1H: dco_decode_f_64(arr[5]),
+      minVolumeEur: dco_decode_f_64(arr[6]),
+      trailingStopPct: dco_decode_f_64(arr[7]),
+      hardSlPct: dco_decode_f_64(arr[8]),
+    );
+  }
+
+  @protected
+  EngineStatusDto dco_decode_engine_status_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return EngineStatusDto(
+      isRunning: dco_decode_bool(arr[0]),
+      eurBalance: dco_decode_f_64(arr[1]),
+      openTradesCount: dco_decode_i_32(arr[2]),
+      totalPairs: dco_decode_i_32(arr[3]),
+      lastTick: dco_decode_i_64(arr[4]),
+      errorMessage: dco_decode_String(arr[5]),
+    );
+  }
+
+  @protected
+  double dco_decode_f_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
+  }
+
+  @protected
+  int dco_decode_i_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeI64(raw);
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  List<TradeDto> dco_decode_list_trade_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_trade_dto).toList();
+  }
+
+  @protected
+  TradeDto dco_decode_trade_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
+    return TradeDto(
+      pair: dco_decode_String(arr[0]),
+      entryPrice: dco_decode_f_64(arr[1]),
+      currentPrice: dco_decode_f_64(arr[2]),
+      amount: dco_decode_f_64(arr[3]),
+      stakeEur: dco_decode_f_64(arr[4]),
+      profitPct: dco_decode_f_64(arr[5]),
+      profitEur: dco_decode_f_64(arr[6]),
+      timeInTradeMin: dco_decode_i_64(arr[7]),
+      trailingStopPct: dco_decode_f_64(arr[8]),
+    );
   }
 
   @protected
@@ -172,10 +495,121 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  bool sse_decode_bool(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint8() != 0;
+  }
+
+  @protected
+  ConfigDto sse_decode_box_autoadd_config_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_config_dto(deserializer));
+  }
+
+  @protected
+  ConfigDto sse_decode_config_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_apiKey = sse_decode_String(deserializer);
+    var var_apiSecret = sse_decode_String(deserializer);
+    var var_maxOpenTrades = sse_decode_i_32(deserializer);
+    var var_minPct24H = sse_decode_f_64(deserializer);
+    var var_minPct15M = sse_decode_f_64(deserializer);
+    var var_minPct1H = sse_decode_f_64(deserializer);
+    var var_minVolumeEur = sse_decode_f_64(deserializer);
+    var var_trailingStopPct = sse_decode_f_64(deserializer);
+    var var_hardSlPct = sse_decode_f_64(deserializer);
+    return ConfigDto(
+      apiKey: var_apiKey,
+      apiSecret: var_apiSecret,
+      maxOpenTrades: var_maxOpenTrades,
+      minPct24H: var_minPct24H,
+      minPct15M: var_minPct15M,
+      minPct1H: var_minPct1H,
+      minVolumeEur: var_minVolumeEur,
+      trailingStopPct: var_trailingStopPct,
+      hardSlPct: var_hardSlPct,
+    );
+  }
+
+  @protected
+  EngineStatusDto sse_decode_engine_status_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_isRunning = sse_decode_bool(deserializer);
+    var var_eurBalance = sse_decode_f_64(deserializer);
+    var var_openTradesCount = sse_decode_i_32(deserializer);
+    var var_totalPairs = sse_decode_i_32(deserializer);
+    var var_lastTick = sse_decode_i_64(deserializer);
+    var var_errorMessage = sse_decode_String(deserializer);
+    return EngineStatusDto(
+      isRunning: var_isRunning,
+      eurBalance: var_eurBalance,
+      openTradesCount: var_openTradesCount,
+      totalPairs: var_totalPairs,
+      lastTick: var_lastTick,
+      errorMessage: var_errorMessage,
+    );
+  }
+
+  @protected
+  double sse_decode_f_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getFloat64();
+  }
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getInt32();
+  }
+
+  @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getPlatformInt64();
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  List<TradeDto> sse_decode_list_trade_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <TradeDto>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_trade_dto(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  TradeDto sse_decode_trade_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_pair = sse_decode_String(deserializer);
+    var var_entryPrice = sse_decode_f_64(deserializer);
+    var var_currentPrice = sse_decode_f_64(deserializer);
+    var var_amount = sse_decode_f_64(deserializer);
+    var var_stakeEur = sse_decode_f_64(deserializer);
+    var var_profitPct = sse_decode_f_64(deserializer);
+    var var_profitEur = sse_decode_f_64(deserializer);
+    var var_timeInTradeMin = sse_decode_i_64(deserializer);
+    var var_trailingStopPct = sse_decode_f_64(deserializer);
+    return TradeDto(
+      pair: var_pair,
+      entryPrice: var_entryPrice,
+      currentPrice: var_currentPrice,
+      amount: var_amount,
+      stakeEur: var_stakeEur,
+      profitPct: var_profitPct,
+      profitEur: var_profitEur,
+      timeInTradeMin: var_timeInTradeMin,
+      trailingStopPct: var_trailingStopPct,
+    );
   }
 
   @protected
@@ -190,21 +624,70 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getInt32();
-  }
-
-  @protected
-  bool sse_decode_bool(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getUint8() != 0;
-  }
-
-  @protected
   void sse_encode_String(String self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(utf8.encoder.convert(self), serializer);
+  }
+
+  @protected
+  void sse_encode_bool(bool self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint8(self ? 1 : 0);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_config_dto(
+    ConfigDto self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_config_dto(self, serializer);
+  }
+
+  @protected
+  void sse_encode_config_dto(ConfigDto self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.apiKey, serializer);
+    sse_encode_String(self.apiSecret, serializer);
+    sse_encode_i_32(self.maxOpenTrades, serializer);
+    sse_encode_f_64(self.minPct24H, serializer);
+    sse_encode_f_64(self.minPct15M, serializer);
+    sse_encode_f_64(self.minPct1H, serializer);
+    sse_encode_f_64(self.minVolumeEur, serializer);
+    sse_encode_f_64(self.trailingStopPct, serializer);
+    sse_encode_f_64(self.hardSlPct, serializer);
+  }
+
+  @protected
+  void sse_encode_engine_status_dto(
+    EngineStatusDto self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_bool(self.isRunning, serializer);
+    sse_encode_f_64(self.eurBalance, serializer);
+    sse_encode_i_32(self.openTradesCount, serializer);
+    sse_encode_i_32(self.totalPairs, serializer);
+    sse_encode_i_64(self.lastTick, serializer);
+    sse_encode_String(self.errorMessage, serializer);
+  }
+
+  @protected
+  void sse_encode_f_64(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putFloat64(self);
+  }
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putInt32(self);
+  }
+
+  @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putPlatformInt64(self);
   }
 
   @protected
@@ -218,6 +701,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_trade_dto(
+    List<TradeDto> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_trade_dto(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_trade_dto(TradeDto self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.pair, serializer);
+    sse_encode_f_64(self.entryPrice, serializer);
+    sse_encode_f_64(self.currentPrice, serializer);
+    sse_encode_f_64(self.amount, serializer);
+    sse_encode_f_64(self.stakeEur, serializer);
+    sse_encode_f_64(self.profitPct, serializer);
+    sse_encode_f_64(self.profitEur, serializer);
+    sse_encode_i_64(self.timeInTradeMin, serializer);
+    sse_encode_f_64(self.trailingStopPct, serializer);
+  }
+
+  @protected
   void sse_encode_u_8(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint8(self);
@@ -226,17 +735,5 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-  }
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putInt32(self);
-  }
-
-  @protected
-  void sse_encode_bool(bool self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putUint8(self ? 1 : 0);
   }
 }
