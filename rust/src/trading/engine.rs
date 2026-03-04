@@ -456,21 +456,36 @@ impl TradingEngine {
                     result
                 );
 
-                self.open_trades.insert(
-                    pair.clone(),
-                    OpenTrade {
-                        pair: pair.clone(),
-                        kraken_pair: candidate.kraken_pair.clone(),
-                        entry_price: candidate.price,
-                        amount,
-                        stake_eur: stake,
-                        highest_price: candidate.price,
-                        trailing_stop_pct: trailing.max(self.config.trailing_stop_pct),
-                        hard_sl_pct: hard_sl.min(self.config.hard_sl_pct),
-                        entry_time: Self::now_sec(),
-                    },
-                );
+                let hard_sl_final = hard_sl.min(self.config.hard_sl_pct);
+                let stop_price = candidate.price * (1.0 + hard_sl_final);
 
+                let mut trade = OpenTrade {
+                    pair: pair.clone(),
+                    kraken_pair: candidate.kraken_pair.clone(),
+                    entry_price: candidate.price,
+                    amount,
+                    stake_eur: stake,
+                    highest_price: candidate.price,
+                    trailing_stop_pct: trailing.max(self.config.trailing_stop_pct),
+                    hard_sl_pct: hard_sl_final,
+                    entry_time: Self::now_sec(),
+                    stop_loss_order_txid: None,
+                    server_stop_price: 0.0,
+                };
+
+                // Place server-side stop-loss order on Kraken
+                match self.place_stop_loss_order(&candidate.kraken_pair, amount, stop_price).await {
+                    Ok(txid) => {
+                        log::info!("Server SL placed for {}: txid={}, price={:.6}", pair, txid, stop_price);
+                        trade.stop_loss_order_txid = Some(txid);
+                        trade.server_stop_price = stop_price;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to place server SL for {}: {} (trade continues with local SL only)", pair, e);
+                    }
+                }
+
+                self.open_trades.insert(pair.clone(), trade);
                 self.eur_balance -= stake;
                 Ok(true)
             }
@@ -487,6 +502,14 @@ impl TradingEngine {
             Some(t) => t.clone(),
             None => return Ok(false),
         };
+
+        // Cancel server-side stop-loss order first to prevent double-sell
+        if let Some(ref txid) = trade.stop_loss_order_txid {
+            match self.cancel_order(txid).await {
+                Ok(_) => log::info!("Cancelled server SL order {} for {}", txid, pair),
+                Err(e) => log::warn!("Failed to cancel server SL {} for {}: {} (may already be triggered)", txid, pair, e),
+            }
+        }
 
         // Execute market sell on Kraken
         let order_result = self
@@ -607,6 +630,9 @@ impl TradingEngine {
             }
         }
 
+        // 2b. Update server-side stop-losses (trailing step-ups)
+        self.update_server_stop_losses(&current_prices).await;
+
         // 3. Detect new pumps (only if we have slots available)
         if self.open_trades.len() < self.config.max_open_trades {
             match self.detect_pumps().await {
@@ -629,6 +655,193 @@ impl TradingEngine {
         }
 
         Ok(())
+    }
+
+    /// Places a stop-loss order on Kraken (sell-stop-loss-limit with trigger price)
+    async fn place_stop_loss_order(&self, kraken_pair: &str, volume: f64, stop_price: f64) -> Result<String> {
+        // Use stop-loss market order: triggers market sell when price drops to stop_price
+        let result = self
+            .api
+            .private_request(
+                "/0/private/AddOrder",
+                vec![
+                    ("pair", kraken_pair.to_string()),
+                    ("type", "sell".to_string()),
+                    ("ordertype", "stop-loss".to_string()),
+                    ("price", format!("{:.8}", stop_price)),
+                    ("volume", format!("{:.8}", volume)),
+                ],
+            )
+            .await?;
+
+        // Extract txid from response
+        let txid = result
+            .get("txid")
+            .and_then(|t| t.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("No txid in AddOrder response: {:?}", result))?
+            .to_string();
+
+        Ok(txid)
+    }
+
+    /// Cancels an order on Kraken by txid
+    async fn cancel_order(&self, txid: &str) -> Result<()> {
+        self.api
+            .private_request(
+                "/0/private/CancelOrder",
+                vec![("txid", txid.to_string())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Updates server-side stop-loss orders for all open trades based on trailing stop step-ups
+    ///
+    /// Called each tick after updating highest_price. If the trailing stop has tightened
+    /// (step-up), we cancel the old SL and place a new one at a higher price.
+    async fn update_server_stop_losses(&mut self, current_prices: &HashMap<String, f64>) {
+        let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
+
+        for pair in pairs {
+            let (kraken_pair, volume, new_stop_price, old_txid) = {
+                let trade = match self.open_trades.get(&pair) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let current_price = match current_prices.get(&pair) {
+                    Some(&p) => p,
+                    None => continue,
+                };
+
+                let profit = trade.profit_pct(current_price);
+
+                // Calculate the effective trailing stop (with step-ups)
+                let mut active_trailing = trade.trailing_stop_pct;
+                let peak_profit = trade.profit_pct(trade.highest_price);
+
+                if peak_profit >= self.config.step_up_2_profit {
+                    active_trailing = active_trailing.max(self.config.step_up_2_trailing);
+                } else if peak_profit >= self.config.step_up_1_profit {
+                    active_trailing = active_trailing.max(self.config.step_up_1_trailing);
+                }
+
+                // New stop price: based on highest price minus trailing percentage
+                // But never lower than the hard stop-loss from entry
+                let trailing_stop_price = trade.highest_price * (1.0 - active_trailing);
+                let hard_stop_price = trade.entry_price * (1.0 + trade.hard_sl_pct);
+                let new_stop = trailing_stop_price.max(hard_stop_price);
+
+                // Only update if the new stop is meaningfully higher than current server stop
+                // (avoid excessive API calls for tiny changes)
+                if new_stop <= trade.server_stop_price * 1.005 {
+                    continue;
+                }
+
+                // Only update if we're in profit enough that trailing matters
+                if profit <= 0.015 {
+                    continue;
+                }
+
+                (
+                    trade.kraken_pair.clone(),
+                    trade.amount,
+                    new_stop,
+                    trade.stop_loss_order_txid.clone(),
+                )
+            };
+
+            // Cancel old order
+            if let Some(ref txid) = old_txid {
+                if let Err(e) = self.cancel_order(txid).await {
+                    log::warn!("Failed to cancel old SL {} for {}: {}", txid, pair, e);
+                    continue;
+                }
+            }
+
+            // Place new order at higher price
+            match self.place_stop_loss_order(&kraken_pair, volume, new_stop_price).await {
+                Ok(new_txid) => {
+                    if let Some(trade) = self.open_trades.get_mut(&pair) {
+                        log::info!(
+                            "Updated server SL for {}: {:.6} -> {:.6} (txid={})",
+                            pair, trade.server_stop_price, new_stop_price, new_txid
+                        );
+                        trade.stop_loss_order_txid = Some(new_txid);
+                        trade.server_stop_price = new_stop_price;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to place updated SL for {}: {}", pair, e);
+                    // Mark the trade as having no server SL since we cancelled the old one
+                    if let Some(trade) = self.open_trades.get_mut(&pair) {
+                        trade.stop_loss_order_txid = None;
+                        trade.server_stop_price = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reconciles local state with Kraken's open orders after a restart.
+    ///
+    /// Checks if server-side stop-loss orders are still open on Kraken.
+    /// If an SL order was filled (i.e., no longer open), the trade was closed
+    /// while the app was offline, and we remove it from local state.
+    pub async fn reconcile_with_kraken(&mut self) -> Result<Vec<String>> {
+        let mut closed_trades: Vec<String> = Vec::new();
+
+        if self.open_trades.is_empty() {
+            return Ok(closed_trades);
+        }
+
+        // Fetch all open orders from Kraken
+        let result = self
+            .api
+            .private_request("/0/private/OpenOrders", vec![])
+            .await?;
+
+        let open_orders = result
+            .get("open")
+            .and_then(|o| o.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        let open_txids: Vec<String> = open_orders.keys().cloned().collect();
+
+        // Check each trade's SL order
+        let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
+        for pair in pairs {
+            let trade = match self.open_trades.get(&pair) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            if let Some(ref sl_txid) = trade.stop_loss_order_txid {
+                if !open_txids.contains(sl_txid) {
+                    // SL order is no longer open -> was triggered, trade is closed
+                    log::info!(
+                        "RECONCILE: SL order {} for {} was triggered while offline. Removing trade.",
+                        sl_txid, pair
+                    );
+                    closed_trades.push(pair.clone());
+                }
+            }
+            // If no SL order was set, we can't determine if the trade was closed
+            // Keep it and let the next tick handle it
+        }
+
+        // Remove closed trades
+        for pair in &closed_trades {
+            self.open_trades.remove(pair);
+            // Set cooldown
+            self.pump_cooldowns
+                .insert(pair.clone(), Self::now_sec() + 1800);
+        }
+
+        Ok(closed_trades)
     }
 
     /// Starts the trading engine

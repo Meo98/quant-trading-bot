@@ -31,6 +31,10 @@ pub struct OpenTrade {
     pub hard_sl_pct: f64,
     /// Unix timestamp when trade was entered
     pub entry_time: u64,
+    /// Kraken order txid for server-side stop-loss (None if not placed)
+    pub stop_loss_order_txid: Option<String>,
+    /// Price at which the server-side stop-loss is set
+    pub server_stop_price: f64,
 }
 
 impl OpenTrade {

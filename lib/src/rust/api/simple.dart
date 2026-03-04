@@ -6,7 +6,8 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `PersistedStateDto`, `PersistedTradeDto`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// Simple greeting function (for testing bridge connection)
 String greet({required String name}) =>
@@ -32,6 +33,18 @@ EngineStatusDto getStatus() => RustLib.instance.api.crateApiSimpleGetStatus();
 /// Get list of open trades
 List<TradeDto> getOpenTrades() =>
     RustLib.instance.api.crateApiSimpleGetOpenTrades();
+
+/// Export current engine state as JSON for persistence on the Dart side
+String exportState() => RustLib.instance.api.crateApiSimpleExportState();
+
+/// Import persisted state into the engine (call after initialize_engine)
+Future<String> importState({required String stateJson}) =>
+    RustLib.instance.api.crateApiSimpleImportState(stateJson: stateJson);
+
+/// Reconcile local state with Kraken's open orders.
+/// Returns a list of trades that were closed while the app was offline.
+Future<List<String>> reconcileState() =>
+    RustLib.instance.api.crateApiSimpleReconcileState();
 
 /// Check if engine is initialized
 bool isInitialized() => RustLib.instance.api.crateApiSimpleIsInitialized();

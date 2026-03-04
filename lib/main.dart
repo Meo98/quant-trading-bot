@@ -6,6 +6,7 @@ import 'package:local_auth/local_auth.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'dart:async';
+import 'dart:developer';
 import 'dart:ui';
 import 'dart:convert';
 
@@ -256,6 +257,16 @@ void onStart(ServiceInstance service) async {
       try {
         final result = await runTick();
         service.setForegroundNotificationInfo(title: "Matrix Quant", content: result);
+
+        // Persist state after each tick
+        try {
+          final stateJson = exportState();
+          const storage = FlutterSecureStorage();
+          await storage.write(key: 'persisted_trade_state', value: stateJson);
+        } catch (e) {
+          // Non-fatal: state persistence failure shouldn't stop trading
+          log('State persistence error: $e');
+        }
       } catch (e) {
         service.setForegroundNotificationInfo(title: "Matrix Quant", content: "Fehler: $e");
       }
@@ -997,6 +1008,24 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
       );
 
       final result = await initializeEngine(config: config);
+
+      // Restore persisted state if available
+      final persistedState = await _storage.read(key: 'persisted_trade_state');
+      if (persistedState != null && persistedState.isNotEmpty) {
+        try {
+          final importResult = await importState(stateJson: persistedState);
+          log('State restored: $importResult');
+
+          // Reconcile with Kraken to detect trades closed while offline
+          final closedTrades = await reconcileState();
+          if (closedTrades.isNotEmpty) {
+            _showSnack('${closedTrades.length} Trade(s) wurden offline geschlossen', AppColors.warning);
+          }
+        } catch (e) {
+          log('State recovery error: $e');
+        }
+      }
+
       _showSnack(result, AppColors.profit);
     } catch (e) {
       _showSnack('Fehler: $e', AppColors.loss);

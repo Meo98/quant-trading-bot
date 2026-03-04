@@ -227,6 +227,139 @@ pub fn get_open_trades() -> Result<Vec<TradeDto>, String> {
     }
 }
 
+// ============================================================================
+// State Persistence & Recovery
+// ============================================================================
+
+/// Persisted state for a single open trade
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTradeDto {
+    pub pair: String,
+    pub kraken_pair: String,
+    pub entry_price: f64,
+    pub amount: f64,
+    pub stake_eur: f64,
+    pub highest_price: f64,
+    pub trailing_stop_pct: f64,
+    pub hard_sl_pct: f64,
+    pub entry_time: i64,
+    pub stop_loss_order_txid: String,
+    pub server_stop_price: f64,
+}
+
+/// Full persisted engine state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedStateDto {
+    pub trades: Vec<PersistedTradeDto>,
+    pub eur_balance: f64,
+    pub timestamp: i64,
+}
+
+/// Export current engine state as JSON for persistence on the Dart side
+#[flutter_rust_bridge::frb(sync)]
+pub fn export_state() -> Result<String, String> {
+    let guard = ENGINE.lock().map_err(|e| e.to_string())?;
+
+    match guard.as_ref() {
+        Some(engine) => {
+            let trades: Vec<PersistedTradeDto> = engine
+                .open_trades
+                .values()
+                .map(|t| PersistedTradeDto {
+                    pair: t.pair.clone(),
+                    kraken_pair: t.kraken_pair.clone(),
+                    entry_price: t.entry_price,
+                    amount: t.amount,
+                    stake_eur: t.stake_eur,
+                    highest_price: t.highest_price,
+                    trailing_stop_pct: t.trailing_stop_pct,
+                    hard_sl_pct: t.hard_sl_pct,
+                    entry_time: t.entry_time as i64,
+                    stop_loss_order_txid: t.stop_loss_order_txid.clone().unwrap_or_default(),
+                    server_stop_price: t.server_stop_price,
+                })
+                .collect();
+
+            let state = PersistedStateDto {
+                trades,
+                eur_balance: engine.eur_balance,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+            };
+
+            serde_json::to_string(&state).map_err(|e| e.to_string())
+        }
+        None => Err("Engine not initialized".to_string()),
+    }
+}
+
+/// Import persisted state into the engine (call after initialize_engine)
+#[flutter_rust_bridge::frb]
+pub async fn import_state(state_json: String) -> Result<String, String> {
+    let state: PersistedStateDto =
+        serde_json::from_str(&state_json).map_err(|e| format!("Invalid state JSON: {}", e))?;
+
+    let mut guard = ENGINE.lock().map_err(|e| e.to_string())?;
+
+    match guard.as_mut() {
+        Some(engine) => {
+            let mut imported = 0;
+            for t in state.trades {
+                let trade = crate::trading::OpenTrade {
+                    pair: t.pair.clone(),
+                    kraken_pair: t.kraken_pair,
+                    entry_price: t.entry_price,
+                    amount: t.amount,
+                    stake_eur: t.stake_eur,
+                    highest_price: t.highest_price,
+                    trailing_stop_pct: t.trailing_stop_pct,
+                    hard_sl_pct: t.hard_sl_pct,
+                    entry_time: t.entry_time as u64,
+                    stop_loss_order_txid: if t.stop_loss_order_txid.is_empty() {
+                        None
+                    } else {
+                        Some(t.stop_loss_order_txid)
+                    },
+                    server_stop_price: t.server_stop_price,
+                };
+                engine.open_trades.insert(t.pair.clone(), trade);
+                imported += 1;
+            }
+
+            Ok(format!("Imported {} trades from persisted state", imported))
+        }
+        None => Err("Engine not initialized".to_string()),
+    }
+}
+
+/// Reconcile local state with Kraken's open orders.
+/// Returns a list of trades that were closed while the app was offline.
+#[flutter_rust_bridge::frb]
+pub async fn reconcile_state() -> Result<Vec<String>, String> {
+    let engine_opt = {
+        let guard = ENGINE.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+
+    match engine_opt {
+        Some(mut engine) => {
+            let closed = engine
+                .reconcile_with_kraken()
+                .await
+                .map_err(|e| format!("Reconciliation error: {}", e))?;
+
+            // Update global state
+            let mut guard = ENGINE.lock().map_err(|e| e.to_string())?;
+            *guard = Some(engine);
+
+            Ok(closed)
+        }
+        None => Err("Engine not initialized".to_string()),
+    }
+}
+
 /// Check if engine is initialized
 #[flutter_rust_bridge::frb(sync)]
 pub fn is_initialized() -> bool {
