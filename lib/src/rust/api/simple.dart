@@ -46,6 +46,11 @@ Future<String> importState({required String stateJson}) =>
 Future<List<String>> reconcileState() =>
     RustLib.instance.api.crateApiSimpleReconcileState();
 
+/// Sync existing Kraken positions into the bot.
+/// Returns list of positions found (e.g. ["BTC/EUR (150.00 EUR)", "ETH/EUR (80.00 EUR)"])
+Future<List<String>> syncExistingPositions() =>
+    RustLib.instance.api.crateApiSimpleSyncExistingPositions();
+
 /// Check if engine is initialized
 bool isInitialized() => RustLib.instance.api.crateApiSimpleIsInitialized();
 

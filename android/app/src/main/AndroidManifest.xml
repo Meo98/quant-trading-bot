@@ -45,6 +45,7 @@
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:foregroundServiceType="dataSync"
             android:exported="false"
+            android:stopWithTask="false"
             tools:replace="android:exported"/>
 
         <!-- Boot Receiver to restart service after reboot -->

@@ -360,6 +360,58 @@ pub async fn reconcile_state() -> Result<Vec<String>, String> {
     }
 }
 
+/// Sync existing Kraken positions into the bot.
+/// Returns list of positions found (e.g. ["BTC/EUR (150.00 EUR)", "ETH/EUR (80.00 EUR)"])
+#[flutter_rust_bridge::frb]
+pub async fn sync_existing_positions() -> Result<Vec<String>, String> {
+    let engine_opt = {
+        let guard = ENGINE.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+
+    match engine_opt {
+        Some(mut engine) => {
+            let synced = engine
+                .sync_existing_positions()
+                .await
+                .map_err(|e| format!("Sync error: {}", e))?;
+
+            // Place server-side stop-losses for synced positions
+            let pairs_needing_sl: Vec<(String, String, f64, f64)> = engine
+                .open_trades
+                .iter()
+                .filter(|(_, t)| t.stop_loss_order_txid.is_none() && t.server_stop_price == 0.0)
+                .map(|(pair, t)| {
+                    let stop_price = t.entry_price * (1.0 + t.hard_sl_pct);
+                    (pair.clone(), t.kraken_pair.clone(), t.amount, stop_price)
+                })
+                .collect();
+
+            for (pair, kraken_pair, amount, stop_price) in pairs_needing_sl {
+                match engine.place_stop_loss_order(&kraken_pair, amount, stop_price).await {
+                    Ok(txid) => {
+                        log::info!("Placed server SL for synced position {}: txid={}", pair, txid);
+                        if let Some(t) = engine.open_trades.get_mut(&pair) {
+                            t.stop_loss_order_txid = Some(txid);
+                            t.server_stop_price = stop_price;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to place SL for synced {}: {}", pair, e);
+                    }
+                }
+            }
+
+            // Update global state
+            let mut guard = ENGINE.lock().map_err(|e| e.to_string())?;
+            *guard = Some(engine);
+
+            Ok(synced)
+        }
+        None => Err("Engine not initialized".to_string()),
+    }
+}
+
 /// Check if engine is initialized
 #[flutter_rust_bridge::frb(sync)]
 pub fn is_initialized() -> bool {

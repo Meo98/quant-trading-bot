@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 1176509411;
+  int get rustContentHash => -154733892;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -102,6 +102,8 @@ abstract class RustLibApi extends BaseApi {
   Future<String> crateApiSimpleStartEngine();
 
   String crateApiSimpleStopEngine();
+
+  Future<List<String>> crateApiSimpleSyncExistingPositions();
 
   String crateApiSimpleUpdateConfig({required ConfigDto config});
 }
@@ -434,13 +436,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "stop_engine", argNames: []);
 
   @override
+  Future<List<String>> crateApiSimpleSyncExistingPositions() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 14,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_list_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSimpleSyncExistingPositionsConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSimpleSyncExistingPositionsConstMeta =>
+      const TaskConstMeta(debugName: "sync_existing_positions", argNames: []);
+
+  @override
   String crateApiSimpleUpdateConfig({required ConfigDto config}) {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_box_autoadd_config_dto(config, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 14)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 15)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,

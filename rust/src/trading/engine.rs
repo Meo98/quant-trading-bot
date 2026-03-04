@@ -658,7 +658,7 @@ impl TradingEngine {
     }
 
     /// Places a stop-loss order on Kraken (sell-stop-loss-limit with trigger price)
-    async fn place_stop_loss_order(&self, kraken_pair: &str, volume: f64, stop_price: f64) -> Result<String> {
+    pub async fn place_stop_loss_order(&self, kraken_pair: &str, volume: f64, stop_price: f64) -> Result<String> {
         // Use stop-loss market order: triggers market sell when price drops to stop_price
         let result = self
             .api
@@ -842,6 +842,156 @@ impl TradingEngine {
         }
 
         Ok(closed_trades)
+    }
+
+    /// Syncs existing Kraken positions into open_trades so the bot is aware
+    /// of positions opened before or outside the bot.
+    ///
+    /// Queries Kraken Balance for all non-EUR assets with value > 0,
+    /// then fetches current prices to calculate entry estimates.
+    pub async fn sync_existing_positions(&mut self) -> Result<Vec<String>> {
+        log::info!("Syncing existing Kraken positions...");
+        let mut synced: Vec<String> = Vec::new();
+
+        // 1. Get all balances
+        let balances_result = self.api.private_request("/0/private/Balance", vec![]).await?;
+        let balances = match balances_result {
+            Value::Object(b) => b,
+            _ => return Ok(synced),
+        };
+
+        // 2. Build a reverse map: Kraken asset name -> (display pair, kraken pair)
+        //    e.g. "XXBT" -> ("BTC/EUR", "XXBTZEUR")
+        //    We need the AssetPairs info for this
+        let pairs_result = self.api.public_request("/0/public/AssetPairs", &[]).await?;
+        let pairs_map = match pairs_result {
+            Value::Object(p) => p,
+            _ => return Ok(synced),
+        };
+
+        // Map: kraken base asset -> (display_name, kraken_pair)
+        let mut asset_to_pair: HashMap<String, (String, String)> = HashMap::new();
+        for (kraken_pair, info) in &pairs_map {
+            let quote = info.get("quote").and_then(|q| q.as_str()).unwrap_or("");
+            if quote != "ZEUR" && quote != "EUR" {
+                continue;
+            }
+            if kraken_pair.contains(".d") {
+                continue;
+            }
+            let base = info.get("base").and_then(|b| b.as_str()).unwrap_or("");
+            let wsname = info.get("wsname").and_then(|w| w.as_str()).unwrap_or(kraken_pair);
+            if !base.is_empty() {
+                asset_to_pair.insert(base.to_string(), (wsname.to_string(), kraken_pair.clone()));
+            }
+        }
+
+        // 3. For each non-EUR balance with amount > 0, check if we already track it
+        let mut positions_to_price: Vec<(String, String, String, f64)> = Vec::new(); // (asset, display, kraken_pair, amount)
+
+        for (asset, value) in &balances {
+            if asset == "ZEUR" || asset == "EUR" || asset == "ZUSD" || asset == "USD" {
+                continue;
+            }
+            let amount = value.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            if amount <= 0.0 {
+                continue;
+            }
+
+            // Find the EUR pair for this asset
+            if let Some((display_name, kraken_pair)) = asset_to_pair.get(asset) {
+                // Skip if we already track this trade
+                if self.open_trades.contains_key(display_name) {
+                    continue;
+                }
+                positions_to_price.push((
+                    asset.clone(),
+                    display_name.clone(),
+                    kraken_pair.clone(),
+                    amount,
+                ));
+            }
+        }
+
+        if positions_to_price.is_empty() {
+            log::info!("No untracked positions found on Kraken.");
+            return Ok(synced);
+        }
+
+        // 4. Fetch current prices for these pairs
+        let pair_list: String = positions_to_price
+            .iter()
+            .map(|(_, _, kp, _)| kp.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let ticker_result = self
+            .api
+            .public_request("/0/public/Ticker", &[("pair", &pair_list)])
+            .await?;
+
+        let tickers = match ticker_result {
+            Value::Object(t) => t,
+            _ => return Ok(synced),
+        };
+
+        // 5. Create OpenTrade entries for each position
+        for (asset, display_name, kraken_pair, amount) in positions_to_price {
+            let ticker = match tickers.get(&kraken_pair) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Current price from ticker (last trade price)
+            let current_price = ticker
+                .get("c")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+
+            if current_price <= 0.0 {
+                continue;
+            }
+
+            let stake_eur = amount * current_price;
+
+            // Skip dust positions (less than 1 EUR)
+            if stake_eur < 1.0 {
+                continue;
+            }
+
+            // Use current price as entry price (we don't know the real entry)
+            // This means the bot will treat it as break-even and apply trailing stop from here
+            let trade = OpenTrade {
+                pair: display_name.clone(),
+                kraken_pair: kraken_pair.clone(),
+                entry_price: current_price,
+                amount,
+                stake_eur,
+                highest_price: current_price,
+                trailing_stop_pct: self.config.trailing_stop_pct,
+                hard_sl_pct: self.config.hard_sl_pct,
+                entry_time: Self::now_sec(),
+                stop_loss_order_txid: None,
+                server_stop_price: 0.0,
+            };
+
+            log::info!(
+                "SYNC: Found existing position {} - {:.8} units @ ~{:.6} EUR (~{:.2} EUR value)",
+                display_name, amount, current_price, stake_eur
+            );
+
+            self.open_trades.insert(display_name.clone(), trade);
+            synced.push(format!("{} ({:.2} EUR)", display_name, stake_eur));
+        }
+
+        if !synced.is_empty() {
+            log::info!("Synced {} existing positions into bot", synced.len());
+        }
+
+        Ok(synced)
     }
 
     /// Starts the trading engine

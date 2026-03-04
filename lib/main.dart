@@ -224,11 +224,14 @@ Future<void> initializeService() async {
     androidConfiguration: AndroidConfiguration(
       onStart: onStart,
       autoStart: false,
+      autoStartOnBoot: false,
       isForegroundMode: true,
       notificationChannelId: 'matrix_quant_channel',
       initialNotificationTitle: 'Matrix Quant',
       initialNotificationContent: 'Engine bereit',
       foregroundServiceNotificationId: 888,
+      // Keep service alive when app is swiped away
+      foregroundServiceTypes: [AndroidForegroundType.dataSync],
     ),
     iosConfiguration: IosConfiguration(
       autoStart: false,
@@ -252,7 +255,12 @@ void onStart(ServiceInstance service) async {
   }
   service.on('stopService').listen((_) => service.stopSelf());
 
-  Timer.periodic(const Duration(seconds: 60), (timer) async {
+  // Read tick interval from storage (default 60s)
+  const storage = FlutterSecureStorage();
+  final intervalStr = await storage.read(key: 'tick_interval_sec') ?? '60';
+  final intervalSec = int.tryParse(intervalStr) ?? 60;
+
+  Timer.periodic(Duration(seconds: intervalSec), (timer) async {
     if (service is AndroidServiceInstance && await service.isForegroundService()) {
       try {
         final result = await runTick();
@@ -907,6 +915,7 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
   double _trailingStop = 10.0;
   double _hardStopLoss = 15.0;
   int _maxTrades = 3;
+  int _tickIntervalSec = 60;
   double _stepUp1Profit = 20.0;
   double _stepUp1Trailing = 15.0;
   double _stepUp2Profit = 50.0;
@@ -944,6 +953,7 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
     _trailingStop = double.tryParse(await _storage.read(key: 'trailing_stop') ?? '') ?? 10.0;
     _hardStopLoss = double.tryParse(await _storage.read(key: 'hard_stop_loss') ?? '') ?? 15.0;
     _maxTrades = int.tryParse(await _storage.read(key: 'max_trades') ?? '') ?? 3;
+    _tickIntervalSec = int.tryParse(await _storage.read(key: 'tick_interval_sec') ?? '') ?? 60;
     _stepUp1Profit = double.tryParse(await _storage.read(key: 'step_up_1_profit') ?? '') ?? 20.0;
     _stepUp1Trailing = double.tryParse(await _storage.read(key: 'step_up_1_trailing') ?? '') ?? 15.0;
     _stepUp2Profit = double.tryParse(await _storage.read(key: 'step_up_2_profit') ?? '') ?? 50.0;
@@ -989,6 +999,7 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
       await _storage.write(key: 'trailing_stop', value: _trailingStop.toString());
       await _storage.write(key: 'hard_stop_loss', value: _hardStopLoss.toString());
       await _storage.write(key: 'max_trades', value: _maxTrades.toString());
+      await _storage.write(key: 'tick_interval_sec', value: _tickIntervalSec.toString());
       await _storage.write(key: 'step_up_1_profit', value: _stepUp1Profit.toString());
       await _storage.write(key: 'step_up_1_trailing', value: _stepUp1Trailing.toString());
       await _storage.write(key: 'step_up_2_profit', value: _stepUp2Profit.toString());
@@ -1024,6 +1035,16 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
         } catch (e) {
           log('State recovery error: $e');
         }
+      }
+
+      // Sync existing Kraken positions (trades opened before or outside the bot)
+      try {
+        final synced = await syncExistingPositions();
+        if (synced.isNotEmpty) {
+          _showSnack('${synced.length} bestehende Position(en) erkannt', AppColors.accent);
+        }
+      } catch (e) {
+        log('Position sync error: $e');
       }
 
       _showSnack(result, AppColors.profit);
@@ -1210,6 +1231,14 @@ class _SettingsScreenState extends State<SettingsScreen> with SingleTickerProvid
                   (v) => setState(() => _maxTrades = v.round()),
                   helpText: HelpTexts.maxTrades,
                   valueFormat: (v) => '${v.round()} Trades',
+                ),
+                const Divider(height: 32),
+                _paramSlider(
+                  'Tick-Intervall',
+                  _tickIntervalSec.toDouble(), 10, 300,
+                  (v) => setState(() => _tickIntervalSec = v.round()),
+                  helpText: '**Tick-Intervall**\n\nWie oft der Bot die Marktdaten abfragt.\n\n• 10-30s: Schnell, mehr API-Calls\n• 60s: Standard\n• 120-300s: Stromsparend',
+                  valueFormat: (v) => '${v.round()}s',
                 ),
                 const Divider(height: 32),
                 _paramSlider(
