@@ -1,28 +1,31 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[flutter_rust_bridge::frb(ignore)]
 pub struct BotConfig {
     pub api_key: String,
     pub api_secret: String,
-    
-    // Pump Logic
-    pub min_price: f64,
-    pub min_pct_24h: f64,
-    pub min_pct_15m: f64,
-    pub min_pct_1h: f64,
-    pub min_volume_eur: f64,
-    
-    // Trailing Stop Logic
-    pub trailing_stop_pct: f64,
-    pub hard_sl_pct: f64,
-    pub step_up_1_profit: f64,
-    pub step_up_1_trailing: f64,
-    pub step_up_2_profit: f64,
-    pub step_up_2_trailing: f64,
-    
-    // Allocation
+
+    /// Max concurrent open positions (default: 2)
     pub max_open_trades: usize,
+    /// Max pairs to watch from liquidity ranking (default: 30)
+    pub max_watched_pairs: usize,
+    /// Minimum 24h EUR volume to consider a pair (default: 50_000)
+    pub min_volume_eur: f64,
+
+    /// RSI threshold for oversold signal (default: 30)
+    pub rsi_oversold: f64,
+    /// RSI threshold for overbought take-profit (default: 72)
+    pub rsi_overbought: f64,
+
+    /// Hard stop = entry - (ATR * this multiplier) (default: 2.5)
+    pub hard_sl_atr_mult: f64,
+    /// Trailing stop = peak - (ATR * this multiplier) (default: 2.0)
+    pub trail_atr_mult: f64,
+
+    /// Max hold time in minutes before time-stop (default: 4320 = 72h)
+    pub max_hold_minutes: u64,
+    /// Max daily drawdown as fraction of start balance (default: 0.15)
+    pub max_daily_drawdown: f64,
 }
 
 impl Default for BotConfig {
@@ -30,18 +33,15 @@ impl Default for BotConfig {
         Self {
             api_key: String::new(),
             api_secret: String::new(),
-            min_price: 0.00000001,
-            min_pct_24h: 5.0,
-            min_pct_15m: 1.0,
-            min_pct_1h: 2.0,
-            min_volume_eur: 10000.0,
-            trailing_stop_pct: 0.10,
-            hard_sl_pct: -0.15,
-            step_up_1_profit: 0.20,
-            step_up_1_trailing: 0.15,
-            step_up_2_profit: 0.50,
-            step_up_2_trailing: 0.25,
-            max_open_trades: 3,
+            max_open_trades: 2,
+            max_watched_pairs: 30,
+            min_volume_eur: 50_000.0,
+            rsi_oversold: 30.0,
+            rsi_overbought: 72.0,
+            hard_sl_atr_mult: 2.5,
+            trail_atr_mult: 2.0,
+            max_hold_minutes: 4320,
+            max_daily_drawdown: 0.15,
         }
     }
 }

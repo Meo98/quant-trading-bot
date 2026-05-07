@@ -1,16 +1,3 @@
-//! Matrix Quant Core - Standalone Daemon Mode
-//!
-//! This binary runs the trading engine as a standalone daemon process.
-//! It reads configuration from config.json and runs the trading loop
-//! indefinitely with 60-second tick intervals.
-//!
-//! # Usage
-//!
-//! ```bash
-//! cd rust && cargo build --release
-//! ./target/release/matrix-quant-core
-//! ```
-
 use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
@@ -24,108 +11,184 @@ mod trading;
 use config::BotConfig;
 use trading::engine::TradingEngine;
 
-/// Configuration structure matching the Python config.json format
 #[derive(Debug, Deserialize)]
 struct ExchangeConfig {
-    name: String,
     key: String,
     secret: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct FileConfig {
+    #[serde(default = "default_max_trades")]
     max_open_trades: usize,
     exchange: ExchangeConfig,
-    #[serde(default)]
-    dry_run: bool,
 }
+
+fn default_max_trades() -> usize {
+    2
+}
+
+const COLLECT_INTERVAL: u64 = 120;
+const EXIT_CHECK_INTERVAL: u64 = 30;
+const BALANCE_INTERVAL: u64 = 300;
+const STATUS_INTERVAL: u64 = 300;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
 
-    log::info!("Matrix Quant Core v0.1.0");
-    log::info!("========================");
+    log::info!("=== Matrix Quant Core v2.0 ===");
+    log::info!("Strategy: RSI Mean-Reversion on Liquid Pairs");
+    log::info!("Collect: {}s | Exit-check: {}s | Balance: {}s",
+        COLLECT_INTERVAL, EXIT_CHECK_INTERVAL, BALANCE_INTERVAL);
 
-    // Load configuration
-    let config_path = Path::new("/home/meo/trading-bot/config.json");
-
-    if !config_path.exists() {
-        log::error!("Config file not found at {:?}", config_path);
-        log::info!("Please create config.json with your Kraken API credentials.");
-        std::process::exit(1);
-    }
-
-    let config_str = fs::read_to_string(config_path)?;
+    let config_path = find_config()?;
+    let config_str = fs::read_to_string(&config_path)?;
     let file_config: FileConfig = serde_json::from_str(&config_str)?;
 
-    // Validate exchange
-    if file_config.exchange.name.to_lowercase() != "kraken" {
-        log::error!("Only Kraken is supported by the Rust core!");
-        std::process::exit(1);
-    }
-
-    if file_config.dry_run {
-        log::warn!("DRY RUN MODE - No real orders will be placed");
-    }
-
-    // Create BotConfig
     let mut bot_config = BotConfig::default();
     bot_config.api_key = file_config.exchange.key;
     bot_config.api_secret = file_config.exchange.secret;
     bot_config.max_open_trades = file_config.max_open_trades;
 
-    log::info!(
-        "Configuration loaded: {} max trades",
-        bot_config.max_open_trades
+    log::info!("Config: max_trades={} | RSI oversold={} overbought={} | SL={}x ATR | Trail={}x ATR",
+        bot_config.max_open_trades,
+        bot_config.rsi_oversold,
+        bot_config.rsi_overbought,
+        bot_config.hard_sl_atr_mult,
+        bot_config.trail_atr_mult,
     );
 
-    // Initialize engine
     let mut engine = TradingEngine::new(bot_config);
 
-    log::info!("Connecting to Kraken...");
-    engine.start().await?;
+    // Retry engine start with backoff (handles no-internet on boot)
+    let mut start_attempt = 0u32;
+    loop {
+        match engine.start().await {
+            Ok(_) => break,
+            Err(e) => {
+                start_attempt += 1;
+                let wait = (30 * start_attempt.min(10)) as u64;
+                log::error!("Start failed (attempt {}): {} — retrying in {}s", start_attempt, e, wait);
+                sleep(Duration::from_secs(wait)).await;
+            }
+        }
+    }
 
-    log::info!(
-        "Engine ready: {} EUR pairs, €{:.2} balance",
-        engine.all_eur_pairs.len(),
-        engine.eur_balance
-    );
+    log::info!("Collecting price data... signals start after ~{} min of data",
+        (55 * COLLECT_INTERVAL) / 60);
 
-    // Main trading loop
-    log::info!("Starting trading loop (60s intervals)...");
-    log::info!("Press Ctrl+C to stop");
+    let mut last_collect = 0u64;
+    let mut last_exit_check = 0u64;
+    let mut last_balance = 0u64;
+    let mut last_status = 0u64;
+    let mut consecutive_errors = 0u32;
 
     loop {
-        match engine.tick().await {
-            Ok(_) => {
-                log::info!(
-                    "Tick complete | Balance: €{:.2} | Open trades: {}",
-                    engine.eur_balance,
-                    engine.open_trades.len()
-                );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-                // Log open trades
-                for trade in engine.open_trades.values() {
-                    let profit = trade.profit_pct(trade.highest_price) * 100.0;
+        // Back off when network is down
+        if consecutive_errors >= 3 {
+            let wait = (30 * consecutive_errors.min(20)) as u64;
+            log::warn!("Network issues ({} errors) — sleeping {}s", consecutive_errors, wait);
+            sleep(Duration::from_secs(wait)).await;
+        }
+
+        // Collect tickers (every 2 min)
+        if now - last_collect >= COLLECT_INTERVAL {
+            last_collect = now;
+            engine.tick_count += 1;
+
+            if let Err(e) = engine.collect_tickers().await {
+                consecutive_errors += 1;
+                log::error!("Ticker collection failed: {}", e);
+                continue;
+            }
+            consecutive_errors = 0;
+
+            engine.reset_daily_if_needed();
+
+            // Scan for entries after collecting
+            let signals = engine.scan_entries();
+            if !signals.is_empty() {
+                log::info!("Entry signals: {}", signals.len());
+                for signal in signals.iter().take(2) {
                     log::info!(
-                        "  {} | Entry: €{:.6} | P/L: {:.1}% | Time: {}min",
-                        trade.pair,
-                        trade.entry_price,
-                        profit,
-                        trade.time_in_trade_min()
+                        "  → {} RSI={:.1} ATR={:.2}% Vol={:.1}x score={:.0}",
+                        signal.pair, signal.rsi, signal.atr_pct * 100.0,
+                        signal.volume_ratio, signal.score
                     );
                 }
             }
-            Err(e) => {
-                log::error!("Tick error: {}", e);
+
+            for signal in signals.iter().take(1) {
+                if engine.open_trades.len() >= engine.config.max_open_trades {
+                    break;
+                }
+                match engine.execute_buy(signal).await {
+                    Ok(true) => log::info!("Opened position: {}", signal.pair),
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::error!("Buy error {}: {}", signal.pair, e);
+                        if e.to_string().contains("Insufficient funds") {
+                            break;
+                        }
+                    }
+                }
             }
         }
 
-        // Wait for next tick
-        sleep(Duration::from_secs(60)).await;
+        // Check exits (every 30s)
+        if now - last_exit_check >= EXIT_CHECK_INTERVAL && !engine.open_trades.is_empty() {
+            last_exit_check = now;
+
+            let exits = engine.scan_exits();
+            for (pair, reason) in exits {
+                if let Err(e) = engine.execute_sell(&pair, &reason).await {
+                    log::error!("Sell error {}: {}", pair, e);
+                }
+            }
+
+            engine.update_trailing_stops().await;
+        }
+
+        // Balance update (every 5 min)
+        if now - last_balance >= BALANCE_INTERVAL {
+            last_balance = now;
+            if let Err(e) = engine.fetch_balance().await {
+                log::error!("Balance fetch failed: {}", e);
+            }
+        }
+
+        // Status log (every 5 min)
+        if now - last_status >= STATUS_INTERVAL {
+            last_status = now;
+            engine.log_status();
+        }
+
+        sleep(Duration::from_secs(5)).await;
     }
+}
+
+fn find_config() -> Result<String> {
+    let candidates = [
+        "config.json",
+        "../config.json",
+        "/home/meo/quant-trading-bot/config.json",
+    ];
+    for path in &candidates {
+        if Path::new(path).exists() {
+            log::info!("Config: {}", path);
+            return Ok(path.to_string());
+        }
+    }
+    anyhow::bail!(
+        "config.json not found. Create one with your Kraken API keys:\n\
+         {{\n  \"max_open_trades\": 2,\n  \"exchange\": {{\n    \"key\": \"YOUR_KEY\",\n    \"secret\": \"YOUR_SECRET\"\n  }}\n}}"
+    );
 }
