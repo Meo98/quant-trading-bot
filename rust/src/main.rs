@@ -1,15 +1,22 @@
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::process;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 mod api;
 mod config;
 mod trading;
 
+use api::ws_client::KrakenWsClient;
 use config::BotConfig;
 use trading::engine::TradingEngine;
+use trading::shared_state::new_shared_indicators;
+use trading::signal::SignalEngine;
+use trading::types::{Timeframe, TradeSignal};
 
 #[derive(Debug, Deserialize)]
 struct ExchangeConfig {
@@ -28,9 +35,8 @@ fn default_max_trades() -> usize {
     2
 }
 
-const COLLECT_INTERVAL: u64 = 120;
-const EXIT_CHECK_INTERVAL: u64 = 30;
-const BALANCE_INTERVAL: u64 = 300;
+const EXIT_CHECK_INTERVAL: u64 = 10;
+const BALANCE_INTERVAL: u64 = 60;
 const STATUS_INTERVAL: u64 = 300;
 
 #[tokio::main]
@@ -39,10 +45,23 @@ async fn main() -> Result<()> {
         .format_timestamp_secs()
         .init();
 
-    log::info!("=== Matrix Quant Core v2.0 ===");
-    log::info!("Strategy: RSI Mean-Reversion on Liquid Pairs");
-    log::info!("Collect: {}s | Exit-check: {}s | Balance: {}s",
-        COLLECT_INTERVAL, EXIT_CHECK_INTERVAL, BALANCE_INTERVAL);
+    // Single instance guard
+    let pid_path = "/tmp/matrix_quant.pid";
+    if Path::new(pid_path).exists() {
+        if let Ok(old_pid) = fs::read_to_string(pid_path) {
+            let old_pid = old_pid.trim();
+            if Path::new(&format!("/proc/{}", old_pid)).exists() {
+                log::error!("Another instance is already running (PID {}). Exiting.", old_pid);
+                process::exit(1);
+            }
+        }
+    }
+    fs::write(pid_path, process::id().to_string()).ok();
+
+    log::info!("=== Matrix Quant Core v3.1 ===");
+    log::info!("Strategy: Chandelier Trailing + ADX Filter + Confluence ≥4.0");
+    log::info!("Exit-check: {}s | Balance: {}s | Status: {}s",
+        EXIT_CHECK_INTERVAL, BALANCE_INTERVAL, STATUS_INTERVAL);
 
     let config_path = find_config()?;
     let config_str = fs::read_to_string(&config_path)?;
@@ -53,17 +72,17 @@ async fn main() -> Result<()> {
     bot_config.api_secret = file_config.exchange.secret;
     bot_config.max_open_trades = file_config.max_open_trades;
 
-    log::info!("Config: max_trades={} | RSI oversold={} overbought={} | SL={}x ATR | Trail={}x ATR",
+    log::info!("Config: max_trades={} | SL={}x ATR | Trail={}x ATR",
         bot_config.max_open_trades,
-        bot_config.rsi_oversold,
-        bot_config.rsi_overbought,
         bot_config.hard_sl_atr_mult,
         bot_config.trail_atr_mult,
     );
 
-    let mut engine = TradingEngine::new(bot_config);
+    let shared = new_shared_indicators();
 
-    // Retry engine start with backoff (handles no-internet on boot)
+    let mut engine = TradingEngine::new(bot_config);
+    engine.set_shared(shared.clone());
+
     let mut start_attempt = 0u32;
     loop {
         match engine.start().await {
@@ -77,102 +96,131 @@ async fn main() -> Result<()> {
         }
     }
 
-    log::info!("Collecting price data... signals start after ~{} min of data",
-        (55 * COLLECT_INTERVAL) / 60);
+    let ws_symbols: Vec<String> = engine.all_eur_pairs.keys().cloned().collect();
+    let pair_map: HashMap<String, String> = engine.all_eur_pairs.clone();
 
-    let mut last_collect = 0u64;
-    let mut last_exit_check = 0u64;
-    let mut last_balance = 0u64;
-    let mut last_status = 0u64;
-    let mut consecutive_errors = 0u32;
+    log::info!("Subscribing to {} pairs via WebSocket", ws_symbols.len());
 
-    loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    let (market_tx, market_rx) = mpsc::channel(10000);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<TradeSignal>(100);
 
-        // Back off when network is down
-        if consecutive_errors >= 3 {
-            let wait = (30 * consecutive_errors.min(20)) as u64;
-            log::warn!("Network issues ({} errors) — sleeping {}s", consecutive_errors, wait);
-            sleep(Duration::from_secs(wait)).await;
+    let mut signal_engine = SignalEngine::new(market_rx, signal_tx, shared.clone(), pair_map);
+
+    // Preload historical OHLC data so signals work immediately
+    log::info!("Fetching tickers for pair selection...");
+    let preload_pairs: Vec<(String, String)> = match engine.collect_tickers().await {
+        Ok(_) => engine
+            .liquid_pairs
+            .iter()
+            .take(50)
+            .map(|(ws, kr, _)| (ws.clone(), kr.clone()))
+            .collect(),
+        Err(e) => {
+            log::warn!("Ticker fetch failed ({}), using alphabetical fallback", e);
+            engine.top_liquid_pairs(50)
         }
+    };
 
-        // Collect tickers (every 2 min)
-        if now - last_collect >= COLLECT_INTERVAL {
-            last_collect = now;
-            engine.tick_count += 1;
-
-            if let Err(e) = engine.collect_tickers().await {
-                consecutive_errors += 1;
-                log::error!("Ticker collection failed: {}", e);
-                continue;
-            }
-            consecutive_errors = 0;
-
-            engine.reset_daily_if_needed();
-
-            // Scan for entries after collecting
-            let signals = engine.scan_entries();
-            if !signals.is_empty() {
-                log::info!("Entry signals: {}", signals.len());
-                for signal in signals.iter().take(2) {
-                    log::info!(
-                        "  → {} RSI={:.1} ATR={:.2}% Vol={:.1}x score={:.0}",
-                        signal.pair, signal.rsi, signal.atr_pct * 100.0,
-                        signal.volume_ratio, signal.score
-                    );
+    log::info!("Preloading OHLC for {} pairs (M1/M5/M15)...", preload_pairs.len());
+    let timeframes = [(1u64, Timeframe::M1), (5, Timeframe::M5), (15, Timeframe::M15)];
+    let mut loaded = 0u32;
+    let mut errors = 0u32;
+    for (ws_name, kraken_pair) in &preload_pairs {
+        for (interval, tf) in &timeframes {
+            match engine.fetch_ohlc(kraken_pair, *interval).await {
+                Ok(candles) if !candles.is_empty() => {
+                    signal_engine.preload(ws_name, *tf, candles);
+                    loaded += 1;
                 }
-            }
-
-            for signal in signals.iter().take(1) {
-                if engine.open_trades.len() >= engine.config.max_open_trades {
-                    break;
-                }
-                match engine.execute_buy(signal).await {
-                    Ok(true) => log::info!("Opened position: {}", signal.pair),
-                    Ok(false) => {}
-                    Err(e) => {
-                        log::error!("Buy error {}: {}", signal.pair, e);
-                        if e.to_string().contains("Insufficient funds") {
-                            break;
-                        }
+                Ok(_) => {}
+                Err(e) => {
+                    errors += 1;
+                    if errors <= 3 {
+                        log::warn!("OHLC fetch {} {}m: {}", ws_name, interval, e);
                     }
                 }
             }
+            sleep(Duration::from_secs(1)).await;
         }
+        if loaded % 30 == 0 && loaded > 0 {
+            log::info!("  preloaded {}/{} datasets...", loaded, preload_pairs.len() * 3);
+        }
+    }
+    log::info!("Preload complete: {} datasets loaded ({} errors)", loaded, errors);
 
-        // Check exits (every 30s)
-        if now - last_exit_check >= EXIT_CHECK_INTERVAL && !engine.open_trades.is_empty() {
-            last_exit_check = now;
+    let ws_client = KrakenWsClient::new(ws_symbols, market_tx);
+    tokio::spawn(async move { ws_client.run().await });
+    tokio::spawn(async move { signal_engine.run().await });
 
-            let exits = engine.scan_exits();
-            for (pair, reason) in exits {
-                if let Err(e) = engine.execute_sell(&pair, &reason).await {
-                    log::error!("Sell error {}: {}", pair, e);
+    log::info!("All tasks spawned — waiting for signals...");
+
+    let mut last_exit_check = 0u64;
+    let mut last_balance = 0u64;
+    let mut last_status = 0u64;
+
+    loop {
+        tokio::select! {
+            signal = signal_rx.recv() => {
+                match signal {
+                    Some(sig) => {
+                        log::info!("Received signal: {} | strength={:.1} | {:?}",
+                            sig.pair, sig.strength, sig.components);
+                        match engine.execute_buy_from_signal(&sig).await {
+                            Ok(true) => log::info!("Opened position: {}", sig.pair),
+                            Ok(false) => {}
+                            Err(e) => {
+                                log::error!("Buy error {}: {}", sig.pair, e);
+                                if e.to_string().contains("Insufficient funds") {
+                                    engine.eur_balance = 0.0;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        log::error!("Signal channel closed — restarting");
+                        break;
+                    }
                 }
             }
+            _ = sleep(Duration::from_secs(2)) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-            engine.update_trailing_stops().await;
-        }
+                engine.update_peaks().await;
 
-        // Balance update (every 5 min)
-        if now - last_balance >= BALANCE_INTERVAL {
-            last_balance = now;
-            if let Err(e) = engine.fetch_balance().await {
-                log::error!("Balance fetch failed: {}", e);
+                if now - last_exit_check >= EXIT_CHECK_INTERVAL && !engine.open_trades.is_empty() {
+                    last_exit_check = now;
+
+                    let (prices, rsis) = engine.snapshot_prices_rsis().await;
+                    let exits = engine.scan_exits_ws(&prices, &rsis).await;
+                    for (pair, reason) in exits {
+                        if let Err(e) = engine.execute_sell(&pair, &reason).await {
+                            log::error!("Sell error {}: {}", pair, e);
+                        }
+                    }
+                    engine.update_trailing_stops_ws(&prices, &rsis).await;
+                }
+
+                if now - last_balance >= BALANCE_INTERVAL {
+                    last_balance = now;
+                    if let Err(e) = engine.fetch_balance().await {
+                        log::error!("Balance fetch failed: {}", e);
+                    }
+                    engine.reset_daily_if_needed();
+                }
+
+                if now - last_status >= STATUS_INTERVAL {
+                    last_status = now;
+                    engine.tick_count += 1;
+                    engine.log_status_ws().await;
+                }
             }
         }
-
-        // Status log (every 5 min)
-        if now - last_status >= STATUS_INTERVAL {
-            last_status = now;
-            engine.log_status();
-        }
-
-        sleep(Duration::from_secs(5)).await;
     }
+
+    Ok(())
 }
 
 fn find_config() -> Result<String> {

@@ -22,7 +22,7 @@ pub struct BotConfig {
     /// Trailing stop = peak - (ATR * this multiplier) (default: 2.0)
     pub trail_atr_mult: f64,
 
-    /// Max hold time in minutes before time-stop (default: 4320 = 72h)
+    /// Max hold time in minutes before time-stop (default: 1440 = 24h)
     pub max_hold_minutes: u64,
     /// Max daily drawdown as fraction of start balance (default: 0.15)
     pub max_daily_drawdown: f64,
@@ -33,15 +33,15 @@ impl Default for BotConfig {
         Self {
             api_key: String::new(),
             api_secret: String::new(),
-            max_open_trades: 2,
+            max_open_trades: 3,
             max_watched_pairs: 30,
             min_volume_eur: 50_000.0,
             rsi_oversold: 30.0,
-            rsi_overbought: 72.0,
-            hard_sl_atr_mult: 2.5,
-            trail_atr_mult: 2.0,
-            max_hold_minutes: 4320,
-            max_daily_drawdown: 0.15,
+            rsi_overbought: 80.0,
+            hard_sl_atr_mult: 2.0,
+            trail_atr_mult: 1.5,
+            max_hold_minutes: 360,
+            max_daily_drawdown: 0.05,
         }
     }
 }

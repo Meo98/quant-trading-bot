@@ -1,30 +1,21 @@
 use crate::api::rest_client::KrakenRestClient;
 use crate::config::BotConfig;
 use crate::trading::indicators::{Indicators, PriceBar};
+use crate::trading::shared_state::SharedIndicators;
+use crate::trading::types::{Candle, TradeSignal};
 use crate::trading::OpenTrade;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RSI_PERIOD: usize = 30;
-const EMA_SHORT: usize = 20;
-const EMA_LONG: usize = 50;
-const ATR_PERIOD: usize = 20;
-const VOL_AVG_PERIOD: usize = 30;
-const MIN_BARS_FOR_SIGNALS: usize = 55;
-const BTC_PAIR: &str = "BTC/EUR";
+const RSI_PERIOD: usize = 14;
 
-#[derive(Debug)]
-pub struct EntrySignal {
-    pub pair: String,
-    pub kraken_pair: String,
-    pub price: f64,
-    pub rsi: f64,
-    pub atr_pct: f64,
-    pub volume_ratio: f64,
-    pub score: f64,
-}
+const MIN_STAKE_EUR: f64 = 8.0;
+const BASE_RISK_PCT: f64 = 0.15;
+const MAX_RISK_PCT: f64 = 0.35;
+const SIGNAL_SCALE_MIN: f64 = 3.0;
+const SIGNAL_SCALE_MAX: f64 = 7.0;
 
 pub struct TradingEngine {
     pub config: BotConfig,
@@ -32,6 +23,8 @@ pub struct TradingEngine {
     pub open_trades: HashMap<String, OpenTrade>,
     pub eur_balance: f64,
     pub all_eur_pairs: HashMap<String, String>,
+    pub pair_decimals: HashMap<String, u8>,
+    pub asset_to_pair: HashMap<String, (String, String)>,
     pub indicators: HashMap<String, Indicators>,
     pub liquid_pairs: Vec<(String, String, f64)>,
     pub cooldowns: HashMap<String, u64>,
@@ -39,6 +32,7 @@ pub struct TradingEngine {
     pub daily_pnl: f64,
     pub last_daily_reset: u64,
     pub tick_count: u64,
+    pub shared: Option<SharedIndicators>,
 }
 
 impl TradingEngine {
@@ -50,6 +44,8 @@ impl TradingEngine {
             open_trades: HashMap::new(),
             eur_balance: 0.0,
             all_eur_pairs: HashMap::new(),
+            pair_decimals: HashMap::new(),
+            asset_to_pair: HashMap::new(),
             indicators: HashMap::new(),
             liquid_pairs: Vec::new(),
             cooldowns: HashMap::new(),
@@ -57,7 +53,12 @@ impl TradingEngine {
             daily_pnl: 0.0,
             last_daily_reset: 0,
             tick_count: 0,
+            shared: None,
         }
+    }
+
+    pub fn set_shared(&mut self, shared: SharedIndicators) {
+        self.shared = Some(shared);
     }
 
     fn now_sec() -> u64 {
@@ -71,7 +72,8 @@ impl TradingEngine {
         log::info!("Starting engine...");
         self.fetch_eur_pairs().await?;
         self.fetch_balance().await?;
-        self.daily_start_balance = self.eur_balance;
+        self.sync_existing_positions().await;
+        self.daily_start_balance = self.eur_balance + self.open_trades.values().map(|t| t.stake_eur).sum::<f64>();
         self.last_daily_reset = Self::now_sec();
         log::info!(
             "Engine ready: {} pairs, €{:.2} balance",
@@ -81,10 +83,180 @@ impl TradingEngine {
         Ok(())
     }
 
+
+    fn pairs_match(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let normalize = |p: &str| -> String {
+            let p = p.to_uppercase();
+            let base = p.strip_suffix("ZEUR")
+                .or_else(|| p.strip_suffix("EUR"))
+                .unwrap_or(&p);
+            let base = base.strip_prefix('X')
+                .filter(|s| s.len() >= 3)
+                .unwrap_or(base);
+            base.to_string()
+        };
+        normalize(a) == normalize(b)
+    }
+
+    async fn find_sl_order_for_pair(&self, kraken_pair: &str) -> Option<(String, f64)> {
+        let orders = match self.api.private_request("/0/private/OpenOrders", vec![]).await {
+            Ok(Value::Object(o)) => o,
+            _ => return None,
+        };
+        let open = match orders.get("open") {
+            Some(Value::Object(o)) => o,
+            _ => return None,
+        };
+        for (txid, info) in open {
+            let descr = match info.get("descr") {
+                Some(d) => d,
+                None => continue,
+            };
+            let pair = descr.get("pair").and_then(|p| p.as_str()).unwrap_or("");
+            let otype = descr.get("ordertype").and_then(|o| o.as_str()).unwrap_or("");
+            let direction = descr.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            if Self::pairs_match(pair, kraken_pair) && otype == "stop-loss" && direction == "sell" {
+                let price = descr.get("price")
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                return Some((txid.clone(), price));
+            }
+        }
+        None
+    }
+
+    async fn cancel_open_orders_for_pair(&self, kraken_pair: &str) {
+        let orders = match self.api.private_request("/0/private/OpenOrders", vec![]).await {
+            Ok(Value::Object(o)) => o,
+            _ => return,
+        };
+        let open = match orders.get("open") {
+            Some(Value::Object(o)) => o,
+            _ => return,
+        };
+        for (txid, info) in open {
+            let pair = info.get("descr")
+                .and_then(|d| d.get("pair"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            if Self::pairs_match(pair, kraken_pair) {
+                log::info!("Cancelling old order {} for {}", txid, kraken_pair);
+                let _ = self.cancel_order(txid).await;
+            }
+        }
+    }
+
+    async fn sync_existing_positions(&mut self) {
+        let balances = match self.api.private_request("/0/private/Balance", vec![]).await {
+            Ok(Value::Object(b)) => b,
+            _ => return,
+        };
+
+        for (asset, val) in &balances {
+            if asset == "ZEUR" || asset == "EUR" || asset == "ZUSD" || asset == "USD" {
+                continue;
+            }
+            let amount: f64 = val.as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            if amount <= 0.0 {
+                continue;
+            }
+
+            let (display, kraken) = match self.asset_to_pair.get(asset) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+
+            if self.open_trades.contains_key(&display) {
+                continue;
+            }
+
+            let ticker = self.api.public_request(
+                "/0/public/Ticker",
+                &[("pair", &kraken)],
+            ).await.ok();
+            let price = ticker.as_ref()
+                .and_then(|t| t.as_object())
+                .and_then(|m| m.values().next())
+                .and_then(|v| v.get("c"))
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|p| p.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+
+            let stake = amount * price;
+            if stake < 1.0 {
+                continue;
+            }
+
+            if crate::trading::types::STABLECOINS.contains(&display.as_str()) {
+                log::info!("Selling stablecoin position: {} | {:.4} units ≈ €{:.2}", display, amount, stake);
+                self.cancel_open_orders_for_pair(&kraken).await;
+                let _ = self.api.private_request(
+                    "/0/private/AddOrder",
+                    vec![
+                        ("pair", kraken.clone()),
+                        ("type", "sell".to_string()),
+                        ("ordertype", "market".to_string()),
+                        ("volume", format!("{:.8}", amount)),
+                    ],
+                ).await;
+                continue;
+            }
+
+            log::info!("Synced position: {} | {:.4} units @ {:.6} ≈ €{:.2}", display, amount, price, stake);
+
+            let entry_atr = 0.02;
+            let hard_sl_price = price * (1.0 - (entry_atr * self.config.hard_sl_atr_mult).clamp(0.03, 0.20));
+
+            let mut trade = OpenTrade {
+                pair: display.clone(),
+                kraken_pair: kraken.clone(),
+                entry_price: price,
+                amount,
+                stake_eur: stake,
+                highest_price: price,
+                entry_time: Self::now_sec(),
+                stop_loss_order_txid: None,
+                server_stop_price: 0.0,
+                entry_atr,
+                exit_reason: None,
+            };
+
+            if let Some((txid, sl_price)) = self.find_sl_order_for_pair(&kraken).await {
+                log::info!("Adopted existing SL for {}: {:.6} ({})", display, sl_price, txid);
+                trade.stop_loss_order_txid = Some(txid);
+                trade.server_stop_price = sl_price;
+            } else {
+                match self.place_stop_loss(&kraken, amount, hard_sl_price).await {
+                    Ok(txid) => {
+                        log::info!("Placed SL for synced {}: {:.6} ({})", display, hard_sl_price, txid);
+                        trade.stop_loss_order_txid = Some(txid);
+                        trade.server_stop_price = hard_sl_price;
+                    }
+                    Err(e) => log::warn!("SL placement failed for synced {}: {}", display, e),
+                }
+            }
+
+            self.open_trades.insert(display, trade);
+        }
+
+        if !self.open_trades.is_empty() {
+            log::info!("Synced {} existing positions", self.open_trades.len());
+        }
+    }
+
     async fn fetch_eur_pairs(&mut self) -> Result<()> {
         let result = self.api.public_request("/0/public/AssetPairs", &[]).await?;
         if let Value::Object(pairs) = result {
             self.all_eur_pairs.clear();
+            self.pair_decimals.clear();
+            self.asset_to_pair.clear();
             for (kraken_pair, info) in pairs {
                 if let Some(quote) = info.get("quote").and_then(|q| q.as_str()) {
                     if (quote == "ZEUR" || quote == "EUR") && !kraken_pair.contains(".d") {
@@ -92,14 +264,87 @@ impl TradingEngine {
                             .get("wsname")
                             .and_then(|w| w.as_str())
                             .unwrap_or(&kraken_pair);
+                        let decimals = info
+                            .get("pair_decimals")
+                            .and_then(|d| d.as_u64())
+                            .unwrap_or(8) as u8;
+                        if let Some(base) = info.get("base").and_then(|b| b.as_str()) {
+                            self.asset_to_pair.insert(
+                                base.to_string(),
+                                (wsname.to_string(), kraken_pair.clone()),
+                            );
+                        }
                         self.all_eur_pairs
                             .insert(wsname.to_string(), kraken_pair.clone());
+                        self.pair_decimals.insert(kraken_pair.clone(), decimals);
                     }
                 }
             }
             log::info!("Loaded {} EUR pairs", self.all_eur_pairs.len());
         }
         Ok(())
+    }
+
+    pub async fn fetch_ohlc(
+        &self,
+        kraken_pair: &str,
+        interval_min: u64,
+    ) -> Result<Vec<Candle>> {
+        let interval_str = interval_min.to_string();
+        let result = self
+            .api
+            .public_request(
+                "/0/public/OHLC",
+                &[("pair", kraken_pair), ("interval", &interval_str)],
+            )
+            .await?;
+
+        let mut candles = Vec::new();
+        if let Value::Object(data) = result {
+            for (key, arr) in &data {
+                if key == "last" {
+                    continue;
+                }
+                if let Value::Array(rows) = arr {
+                    for row in rows {
+                        if let Value::Array(fields) = row {
+                            if fields.len() < 7 {
+                                continue;
+                            }
+                            let ts = fields[0].as_u64().unwrap_or(0);
+                            let open = fields[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                            let high = fields[2].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                            let low = fields[3].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                            let close = fields[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                            let volume = fields[6].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                            if close > 0.0 {
+                                candles.push(Candle {
+                                    timestamp: ts,
+                                    open,
+                                    high,
+                                    low,
+                                    close,
+                                    volume,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        candles.sort_by_key(|c| c.timestamp);
+        Ok(candles)
+    }
+
+    pub fn top_liquid_pairs(&self, count: usize) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = self
+            .all_eur_pairs
+            .iter()
+            .map(|(ws, kr)| (ws.clone(), kr.clone()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs.truncate(count);
+        pairs
     }
 
     pub async fn fetch_balance(&mut self) -> Result<()> {
@@ -111,6 +356,43 @@ impl TradingEngine {
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
+
+            if !self.open_trades.is_empty() {
+                let mut pairs_with_balance: HashMap<String, f64> = HashMap::new();
+                for (asset, val) in &balances {
+                    if asset == "ZEUR" || asset == "EUR" || asset == "ZUSD" || asset == "USD" {
+                        continue;
+                    }
+                    let amount: f64 = val.as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    if amount <= 0.0 {
+                        continue;
+                    }
+                    if let Some((display, _)) = self.asset_to_pair.get(asset) {
+                        pairs_with_balance.insert(display.clone(), amount);
+                    }
+                }
+
+                let mut ghosts = Vec::new();
+                for (pair, trade) in &self.open_trades {
+                    match pairs_with_balance.get(pair) {
+                        Some(&bal) if bal >= trade.amount * 0.5 => {}
+                        _ => ghosts.push(pair.clone()),
+                    }
+                }
+
+                for pair in ghosts {
+                    if let Some(trade) = self.open_trades.remove(&pair) {
+                        log::warn!(
+                            "GHOST detected: {} — asset gone from Kraken (server SL triggered). \
+                             Removing after {}m. Entry: {:.6}, Stake: €{:.2}",
+                            pair, trade.age_minutes(), trade.entry_price, trade.stake_eur
+                        );
+                        self.cooldowns.insert(pair, Self::now_sec() + 3600);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -181,11 +463,13 @@ impl TradingEngine {
             let ind = self
                 .indicators
                 .entry(display_name.clone())
-                .or_insert_with(|| Indicators::new(500));
+                .or_insert_with(|| Indicators::with_capacity(500));
             ind.push(PriceBar {
                 timestamp: now,
-                price,
-                volume_eur,
+                close: price,
+                high: price,
+                low: price,
+                volume: volume_eur,
             });
 
             if volume_eur >= self.config.min_volume_eur {
@@ -216,299 +500,8 @@ impl TradingEngine {
             .and_then(|s| s.parse::<f64>().ok())
     }
 
-    /// Scan liquid pairs for entry signals (RSI oversold bounce)
-    pub fn scan_entries(&self) -> Vec<EntrySignal> {
-        let mut signals = Vec::new();
 
-        if !self.is_daily_drawdown_ok() {
-            return signals;
-        }
 
-        if self.open_trades.len() >= self.config.max_open_trades {
-            return signals;
-        }
-
-        // BTC market filter
-        if let Some(btc_ind) = self.indicators.get(BTC_PAIR) {
-            if let Some(btc_rsi) = btc_ind.rsi(RSI_PERIOD) {
-                if btc_rsi < 20.0 {
-                    log::info!("Market filter: BTC RSI={:.1} (too low), skipping entries", btc_rsi);
-                    return signals;
-                }
-            }
-        }
-
-        let now = Self::now_sec();
-
-        for (display, kraken, _vol) in &self.liquid_pairs {
-            if self.open_trades.contains_key(display) {
-                continue;
-            }
-            if let Some(&cd) = self.cooldowns.get(display) {
-                if now < cd {
-                    continue;
-                }
-            }
-
-            let ind = match self.indicators.get(display) {
-                Some(i) if i.len() >= MIN_BARS_FOR_SIGNALS => i,
-                _ => continue,
-            };
-
-            let rsi = match ind.rsi(RSI_PERIOD) {
-                Some(r) => r,
-                None => continue,
-            };
-            let rsi_prev = match ind.rsi_prev(RSI_PERIOD) {
-                Some(r) => r,
-                None => continue,
-            };
-            let price = match ind.last_price() {
-                Some(p) => p,
-                None => continue,
-            };
-            let ema_short = match ind.ema(EMA_SHORT) {
-                Some(e) => e,
-                None => continue,
-            };
-            let atr_pct = match ind.atr_pct(ATR_PERIOD) {
-                Some(a) => a,
-                None => continue,
-            };
-
-            // Volume confirmation
-            let vol_ratio = match (ind.current_volume(), ind.avg_volume(VOL_AVG_PERIOD)) {
-                (Some(cur), Some(avg)) if avg > 0.0 => cur / avg,
-                _ => 1.0,
-            };
-
-            // === ENTRY CONDITIONS ===
-            // 1. RSI crossed up from oversold zone (<30 → >30)
-            let rsi_cross_up = rsi_prev < self.config.rsi_oversold && rsi >= self.config.rsi_oversold;
-
-            // 2. Or RSI is in recovery zone (30-40) AND price above short EMA (trend confirmation)
-            let rsi_recovery = rsi > self.config.rsi_oversold
-                && rsi < 40.0
-                && price > ema_short;
-
-            if !rsi_cross_up && !rsi_recovery {
-                continue;
-            }
-
-            // 3. Volume at least average (no dead-cat bounces on zero volume)
-            if vol_ratio < 0.8 {
-                continue;
-            }
-
-            // 4. ATR sanity: skip extremely volatile or dead pairs
-            if atr_pct < 0.001 || atr_pct > 0.15 {
-                continue;
-            }
-
-            let score = (40.0 - rsi) * vol_ratio * (1.0 / atr_pct.max(0.01));
-
-            signals.push(EntrySignal {
-                pair: display.clone(),
-                kraken_pair: kraken.clone(),
-                price,
-                rsi,
-                atr_pct,
-                volume_ratio: vol_ratio,
-                score,
-            });
-        }
-
-        signals.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        signals
-    }
-
-    /// Check all open trades for exit conditions
-    pub fn scan_exits(&mut self) -> Vec<(String, String)> {
-        let mut exits = Vec::new();
-
-        let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
-        for pair in pairs {
-            let trade = match self.open_trades.get_mut(&pair) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let ind = match self.indicators.get(&pair) {
-                Some(i) => i,
-                None => continue,
-            };
-
-            let price = match ind.last_price() {
-                Some(p) => p,
-                None => continue,
-            };
-
-            if price > trade.highest_price {
-                trade.highest_price = price;
-            }
-
-            let profit = trade.profit_pct(price);
-            let profit_eur = trade.profit_eur(price);
-            let age = trade.age_minutes();
-
-            // 1. Hard stop: entry price - 2.5x ATR
-            let hard_sl_pct = -(trade.entry_atr * self.config.hard_sl_atr_mult).clamp(0.03, 0.20);
-            if profit <= hard_sl_pct {
-                exits.push((
-                    pair.clone(),
-                    format!(
-                        "HARD-SL: {:.1}% (limit {:.1}%) | €{:.2}",
-                        profit * 100.0,
-                        hard_sl_pct * 100.0,
-                        profit_eur
-                    ),
-                ));
-                continue;
-            }
-
-            // 2. Trailing stop: 2x ATR from peak (only after 1.5% profit)
-            if profit > 0.015 {
-                let trail_pct = (trade.entry_atr * self.config.trail_atr_mult).clamp(0.02, 0.12);
-                let drawdown = trade.drawdown_from_high(price);
-                if drawdown <= -trail_pct {
-                    exits.push((
-                        pair.clone(),
-                        format!(
-                            "TRAIL-STOP: {:.1}% from peak (trail {:.1}%) | P/L: {:.1}% €{:.2}",
-                            drawdown * 100.0,
-                            trail_pct * 100.0,
-                            profit * 100.0,
-                            profit_eur
-                        ),
-                    ));
-                    continue;
-                }
-            }
-
-            // 3. RSI overbought take-profit
-            if let Some(rsi) = ind.rsi(RSI_PERIOD) {
-                if rsi > self.config.rsi_overbought && profit > 0.01 {
-                    exits.push((
-                        pair.clone(),
-                        format!(
-                            "RSI-TP: RSI={:.1} | P/L: {:.1}% €{:.2}",
-                            rsi,
-                            profit * 100.0,
-                            profit_eur
-                        ),
-                    ));
-                    continue;
-                }
-            }
-
-            // 4. Time stop: after max_hold_hours with no meaningful profit
-            if age > self.config.max_hold_minutes && profit < 0.02 {
-                exits.push((
-                    pair.clone(),
-                    format!(
-                        "TIME-STOP: {}h {}m | P/L: {:.1}% €{:.2}",
-                        age / 60,
-                        age % 60,
-                        profit * 100.0,
-                        profit_eur
-                    ),
-                ));
-            }
-        }
-
-        exits
-    }
-
-    pub async fn execute_buy(&mut self, signal: &EntrySignal) -> Result<bool> {
-        if self.open_trades.contains_key(&signal.pair) {
-            return Ok(false);
-        }
-        if self.open_trades.len() >= self.config.max_open_trades {
-            return Ok(false);
-        }
-
-        let remaining = self.config.max_open_trades - self.open_trades.len();
-        let stake = (self.eur_balance * 0.45 / remaining as f64).min(self.eur_balance * 0.95);
-        if stake < 5.0 {
-            log::warn!("Skip buy {}: stake €{:.2} too small", signal.pair, stake);
-            return Ok(false);
-        }
-
-        let amount = stake / signal.price;
-
-        let result = self
-            .api
-            .private_request(
-                "/0/private/AddOrder",
-                vec![
-                    ("pair", signal.kraken_pair.clone()),
-                    ("type", "buy".to_string()),
-                    ("ordertype", "market".to_string()),
-                    ("volume", format!("{:.8}", amount)),
-                ],
-            )
-            .await;
-
-        match result {
-            Ok(resp) => {
-                log::info!(
-                    "BUY {} | €{:.2} @ {:.6} | RSI={:.1} ATR={:.2}% VolR={:.1}x | {:?}",
-                    signal.pair,
-                    stake,
-                    signal.price,
-                    signal.rsi,
-                    signal.atr_pct * 100.0,
-                    signal.volume_ratio,
-                    resp
-                );
-
-                let hard_sl_price =
-                    signal.price * (1.0 - (signal.atr_pct * self.config.hard_sl_atr_mult).clamp(0.03, 0.20));
-
-                let mut trade = OpenTrade {
-                    pair: signal.pair.clone(),
-                    kraken_pair: signal.kraken_pair.clone(),
-                    entry_price: signal.price,
-                    amount,
-                    stake_eur: stake,
-                    highest_price: signal.price,
-                    entry_time: Self::now_sec(),
-                    stop_loss_order_txid: None,
-                    server_stop_price: 0.0,
-                    entry_atr: signal.atr_pct,
-                    exit_reason: None,
-                };
-
-                match self
-                    .place_stop_loss(&signal.kraken_pair, amount, hard_sl_price)
-                    .await
-                {
-                    Ok(txid) => {
-                        log::info!(
-                            "Server SL for {}: {:.6} (txid={})",
-                            signal.pair,
-                            hard_sl_price,
-                            txid
-                        );
-                        trade.stop_loss_order_txid = Some(txid);
-                        trade.server_stop_price = hard_sl_price;
-                    }
-                    Err(e) => log::error!("SL placement failed for {}: {}", signal.pair, e),
-                }
-
-                self.open_trades.insert(signal.pair.clone(), trade);
-                self.eur_balance -= stake;
-                Ok(true)
-            }
-            Err(e) => {
-                log::error!("Buy failed {}: {}", signal.pair, e);
-                if e.to_string().contains("Insufficient funds") {
-                    self.eur_balance = 0.0;
-                }
-                Err(e)
-            }
-        }
-    }
 
     pub async fn execute_sell(&mut self, pair: &str, reason: &str) -> Result<bool> {
         let trade = match self.open_trades.get(pair) {
@@ -519,8 +512,15 @@ impl TradingEngine {
         if let Some(ref txid) = trade.stop_loss_order_txid {
             match self.cancel_order(txid).await {
                 Ok(_) => log::info!("Cancelled SL {} for {}", txid, pair),
-                Err(e) => log::warn!("SL cancel failed for {}: {}", pair, e),
+                Err(_) => {
+                    if let Some((found_txid, _)) = self.find_sl_order_for_pair(&trade.kraken_pair).await {
+                        let _ = self.cancel_order(&found_txid).await;
+                        log::info!("Cancelled found SL {} for {}", found_txid, pair);
+                    }
+                }
             }
+        } else {
+            self.cancel_open_orders_for_pair(&trade.kraken_pair).await;
         }
 
         let result = self
@@ -538,12 +538,10 @@ impl TradingEngine {
 
         match result {
             Ok(resp) => {
-                let pnl = trade.profit_eur(
-                    self.indicators
-                        .get(pair)
-                        .and_then(|i| i.last_price())
-                        .unwrap_or(trade.entry_price),
-                );
+                let sell_price = self.get_ws_price(pair).await
+                    .or_else(|| self.indicators.get(pair).and_then(|i| i.last_price()))
+                    .unwrap_or(trade.entry_price);
+                let pnl = trade.profit_eur(sell_price);
                 self.daily_pnl += pnl;
 
                 log::info!(
@@ -561,80 +559,24 @@ impl TradingEngine {
                 Ok(true)
             }
             Err(e) => {
-                log::error!("Sell failed {}: {}", pair, e);
+                let msg = e.to_string();
+                log::error!("Sell failed {}: {}", pair, msg);
+                if msg.contains("Insufficient funds") {
+                    log::warn!(
+                        "Sell blocked for {} — SL order may be holding asset. \
+                         Ghost check in fetch_balance will verify.",
+                        pair
+                    );
+                }
                 Err(e)
             }
         }
     }
 
-    pub async fn update_trailing_stops(&mut self) {
-        let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
 
-        for pair in pairs {
-            let (kraken_pair, amount, new_stop, old_txid) = {
-                let trade = match self.open_trades.get(&pair) {
-                    Some(t) => t,
-                    None => continue,
-                };
-
-                let price = match self.indicators.get(&pair).and_then(|i| i.last_price()) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let profit = trade.profit_pct(price);
-                if profit <= 0.015 {
-                    continue;
-                }
-
-                let trail_pct = (trade.entry_atr * self.config.trail_atr_mult).clamp(0.02, 0.12);
-                let new_stop = trade.highest_price * (1.0 - trail_pct);
-                let hard_stop =
-                    trade.entry_price * (1.0 - (trade.entry_atr * self.config.hard_sl_atr_mult).clamp(0.03, 0.20));
-                let new_stop = new_stop.max(hard_stop);
-
-                if new_stop <= trade.server_stop_price * 1.01 {
-                    continue;
-                }
-
-                (
-                    trade.kraken_pair.clone(),
-                    trade.amount,
-                    new_stop,
-                    trade.stop_loss_order_txid.clone(),
-                )
-            };
-
-            if let Some(ref txid) = old_txid {
-                if let Err(e) = self.cancel_order(txid).await {
-                    log::warn!("Cancel old SL for {}: {}", pair, e);
-                    continue;
-                }
-            }
-
-            match self.place_stop_loss(&kraken_pair, amount, new_stop).await {
-                Ok(txid) => {
-                    if let Some(trade) = self.open_trades.get_mut(&pair) {
-                        log::info!(
-                            "SL update {}: {:.6} → {:.6} ({})",
-                            pair,
-                            trade.server_stop_price,
-                            new_stop,
-                            txid
-                        );
-                        trade.stop_loss_order_txid = Some(txid);
-                        trade.server_stop_price = new_stop;
-                    }
-                }
-                Err(e) => {
-                    log::error!("SL update failed for {}: {}", pair, e);
-                    if let Some(trade) = self.open_trades.get_mut(&pair) {
-                        trade.stop_loss_order_txid = None;
-                        trade.server_stop_price = 0.0;
-                    }
-                }
-            }
-        }
+    fn format_price(&self, kraken_pair: &str, price: f64) -> String {
+        let decimals = self.pair_decimals.get(kraken_pair).copied().unwrap_or(8) as usize;
+        format!("{:.prec$}", price, prec = decimals)
     }
 
     async fn place_stop_loss(
@@ -651,7 +593,7 @@ impl TradingEngine {
                     ("pair", kraken_pair.to_string()),
                     ("type", "sell".to_string()),
                     ("ordertype", "stop-loss".to_string()),
-                    ("price", format!("{:.8}", stop_price)),
+                    ("price", self.format_price(kraken_pair, stop_price)),
                     ("volume", format!("{:.8}", volume)),
                 ],
             )
@@ -673,24 +615,402 @@ impl TradingEngine {
         Ok(())
     }
 
-    pub fn log_status(&self) {
-        self.tick_count;
-        let open_value: f64 = self
-            .open_trades
-            .values()
-            .map(|t| {
-                let price = self
-                    .indicators
-                    .get(&t.pair)
-                    .and_then(|i| i.last_price())
-                    .unwrap_or(t.entry_price);
-                t.amount * price
-            })
-            .sum();
+    pub async fn update_peaks(&mut self) {
+        for trade in self.open_trades.values_mut() {
+            if let Some(ref shared) = self.shared {
+                let state = shared.read().await;
+                if let Some(snap) = state.get(&trade.pair) {
+                    if snap.last_price > trade.highest_price {
+                        trade.highest_price = snap.last_price;
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_ws_price(&self, pair: &str) -> Option<f64> {
+        if let Some(ref shared) = self.shared {
+            let state = shared.read().await;
+            if let Some(snap) = state.get(pair) {
+                if snap.last_price > 0.0 {
+                    return Some(snap.last_price);
+                }
+            }
+        }
+        self.indicators.get(pair).and_then(|i| i.last_price())
+    }
+
+    pub async fn get_ws_rsi(&self, pair: &str) -> Option<f64> {
+        if let Some(ref shared) = self.shared {
+            let state = shared.read().await;
+            if let Some(snap) = state.get(pair) {
+                if let Some(rsi) = snap.rsi_5m {
+                    return Some(rsi);
+                }
+            }
+        }
+        self.indicators.get(pair).and_then(|i| i.rsi(RSI_PERIOD))
+    }
+
+    fn compute_position_size(&self, signal: &TradeSignal) -> f64 {
+        let total_capital = self.eur_balance
+            + self.open_trades.values().map(|t| t.stake_eur).sum::<f64>();
+        if total_capital < MIN_STAKE_EUR {
+            return 0.0;
+        }
+
+        let strength_frac = ((signal.strength - SIGNAL_SCALE_MIN) / (SIGNAL_SCALE_MAX - SIGNAL_SCALE_MIN))
+            .clamp(0.0, 1.0);
+        let risk_pct = BASE_RISK_PCT + strength_frac * (MAX_RISK_PCT - BASE_RISK_PCT);
+
+        let vol_adj = if signal.atr_pct > 0.05 {
+            0.5
+        } else if signal.atr_pct > 0.03 {
+            0.75
+        } else {
+            1.0
+        };
+
+        let remaining = self.config.max_open_trades - self.open_trades.len();
+        let max_per_slot = self.eur_balance / remaining.max(1) as f64;
+
+        let stake = (total_capital * risk_pct * vol_adj).min(max_per_slot).min(self.eur_balance * 0.95);
+
+        stake.max(0.0)
+    }
+
+    pub async fn execute_buy_from_signal(&mut self, signal: &TradeSignal) -> Result<bool> {
+        if self.open_trades.contains_key(&signal.pair) {
+            return Ok(false);
+        }
+        if self.open_trades.len() >= self.config.max_open_trades {
+            return Ok(false);
+        }
+        if !self.is_daily_drawdown_ok() {
+            return Ok(false);
+        }
+
+        let now = Self::now_sec();
+        if let Some(&cd) = self.cooldowns.get(&signal.pair) {
+            if now < cd {
+                return Ok(false);
+            }
+        }
+
+        let stake = self.compute_position_size(signal);
+        if stake < MIN_STAKE_EUR {
+            log::debug!("Skip signal {}: stake €{:.2} too small", signal.pair, stake);
+            return Ok(false);
+        }
+
+        let amount = stake / signal.price;
+
+        let result = self
+            .api
+            .private_request(
+                "/0/private/AddOrder",
+                vec![
+                    ("pair", signal.kraken_pair.clone()),
+                    ("type", "buy".to_string()),
+                    ("ordertype", "market".to_string()),
+                    ("volume", format!("{:.8}", amount)),
+                ],
+            )
+            .await;
+
+        match result {
+            Ok(resp) => {
+                log::info!(
+                    "BUY {} | €{:.2} @ {:.6} | strength={:.1} ATR={:.2}% | components: {:?} | {:?}",
+                    signal.pair, stake, signal.price, signal.strength,
+                    signal.atr_pct * 100.0, signal.components, resp
+                );
+
+                let hard_sl_price = signal.price
+                    * (1.0 - (signal.atr_pct * self.config.hard_sl_atr_mult).clamp(0.03, 0.20));
+
+                let mut trade = OpenTrade {
+                    pair: signal.pair.clone(),
+                    kraken_pair: signal.kraken_pair.clone(),
+                    entry_price: signal.price,
+                    amount,
+                    stake_eur: stake,
+                    highest_price: signal.price,
+                    entry_time: now,
+                    stop_loss_order_txid: None,
+                    server_stop_price: 0.0,
+                    entry_atr: signal.atr_pct,
+                    exit_reason: None,
+                };
+
+                let mut sl_placed = false;
+                for attempt in 0..2 {
+                    match self
+                        .place_stop_loss(&signal.kraken_pair, amount, hard_sl_price)
+                        .await
+                    {
+                        Ok(txid) => {
+                            log::info!("Server SL for {}: {:.6} ({})", signal.pair, hard_sl_price, txid);
+                            trade.stop_loss_order_txid = Some(txid);
+                            trade.server_stop_price = hard_sl_price;
+                            sl_placed = true;
+                            break;
+                        }
+                        Err(e) => {
+                            log::error!("SL placement failed for {} (attempt {}): {}", signal.pair, attempt + 1, e);
+                            if attempt == 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                    }
+                }
+                if !sl_placed {
+                    log::error!("CRITICAL: {} has NO stop-loss protection!", signal.pair);
+                }
+
+                self.open_trades.insert(signal.pair.clone(), trade);
+                self.eur_balance -= stake;
+                self.cooldowns.insert(signal.pair.clone(), now + 3600);
+                Ok(true)
+            }
+            Err(e) => {
+                log::error!("Buy failed {}: {}", signal.pair, e);
+                if e.to_string().contains("Insufficient funds") {
+                    self.eur_balance = 0.0;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn snapshot_prices_rsis(&self) -> (HashMap<String, f64>, HashMap<String, f64>) {
+        let mut prices = HashMap::new();
+        let mut rsis = HashMap::new();
+        for pair in self.open_trades.keys() {
+            if let Some(p) = self.get_ws_price(pair).await {
+                prices.insert(pair.clone(), p);
+            }
+            if let Some(r) = self.get_ws_rsi(pair).await {
+                rsis.insert(pair.clone(), r);
+            }
+        }
+        (prices, rsis)
+    }
+
+    pub async fn scan_exits_ws(&mut self, prices: &HashMap<String, f64>, rsis: &HashMap<String, f64>) -> Vec<(String, String)> {
+        let mut exits = Vec::new();
+
+        let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
+
+        for pair in pairs {
+            let trade = match self.open_trades.get_mut(&pair) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let price = match prices.get(&pair) {
+                Some(&p) => p,
+                None => continue,
+            };
+
+            if price > trade.highest_price {
+                trade.highest_price = price;
+            }
+
+            let profit = trade.profit_pct(price);
+            let profit_eur = trade.profit_eur(price);
+            let age = trade.age_minutes();
+            let atr = trade.entry_atr;
+            let profit_in_atr = if atr > 0.0 { profit / atr } else { 0.0 };
+
+            // 1. Hard stop-loss
+            let hard_sl_pct = -(atr * self.config.hard_sl_atr_mult).clamp(0.03, 0.15);
+            if profit <= hard_sl_pct {
+                exits.push((
+                    pair.clone(),
+                    format!("HARD-SL: {:.1}% (limit {:.1}%) | €{:.2}", profit * 100.0, hard_sl_pct * 100.0, profit_eur),
+                ));
+                continue;
+            }
+
+            // 2. Breakeven stop: if price reached 1x ATR above entry but fell back
+            let peak_profit_pct = (trade.highest_price - trade.entry_price) / trade.entry_price;
+            let peak_in_atr = if atr > 0.0 { peak_profit_pct / atr } else { 0.0 };
+            if peak_in_atr >= 1.0 && price <= trade.entry_price * 1.002 {
+                exits.push((
+                    pair.clone(),
+                    format!("BREAKEVEN: peaked {:.1}x ATR, back at entry | €{:.2}", peak_in_atr, profit_eur),
+                ));
+                continue;
+            }
+
+            // 3. Progressive Chandelier trailing stop
+            let trail_mult = if profit_in_atr >= 3.0 {
+                1.0
+            } else if profit_in_atr >= 2.0 {
+                1.25
+            } else if profit_in_atr >= 1.0 {
+                self.config.trail_atr_mult
+            } else {
+                0.0
+            };
+
+            // RSI extreme: tighten trail further
+            let trail_mult = if let Some(&rsi) = rsis.get(&pair) {
+                if rsi > self.config.rsi_overbought && trail_mult > 0.0 {
+                    trail_mult.min(0.75)
+                } else {
+                    trail_mult
+                }
+            } else {
+                trail_mult
+            };
+
+            if trail_mult > 0.0 {
+                let trail_pct = (atr * trail_mult).clamp(0.01, 0.10);
+                let drawdown = trade.drawdown_from_high(price);
+                if drawdown <= -trail_pct {
+                    exits.push((
+                        pair.clone(),
+                        format!("TRAIL-STOP: {:.1}% from peak (trail {:.1}x ATR) | P/L: {:.1}% €{:.2}",
+                            drawdown * 100.0, trail_mult, profit * 100.0, profit_eur),
+                    ));
+                    continue;
+                }
+            }
+
+            // 4. Time stop (6h with no meaningful profit)
+            if age > self.config.max_hold_minutes && profit_in_atr < 1.0 {
+                exits.push((
+                    pair.clone(),
+                    format!("TIME-STOP: {}h {}m | P/L: {:.1}% €{:.2}", age / 60, age % 60, profit * 100.0, profit_eur),
+                ));
+            }
+        }
+
+        exits
+    }
+
+    pub async fn update_trailing_stops_ws(&mut self, prices: &HashMap<String, f64>, rsis: &HashMap<String, f64>) {
+        let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
+
+        for pair in pairs {
+            let (kraken_pair, amount, new_stop, old_txid) = {
+                let trade = match self.open_trades.get(&pair) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let price = match prices.get(&pair) {
+                    Some(&p) => p,
+                    None => continue,
+                };
+
+                let profit = trade.profit_pct(price);
+                let atr = trade.entry_atr;
+                let profit_in_atr = if atr > 0.0 { profit / atr } else { 0.0 };
+
+                // Progressive trail: tighter as profit grows
+                let trail_mult = if profit_in_atr >= 3.0 {
+                    1.0
+                } else if profit_in_atr >= 2.0 {
+                    1.25
+                } else if profit_in_atr >= 1.0 {
+                    self.config.trail_atr_mult
+                } else {
+                    0.0
+                };
+
+                if trail_mult == 0.0 {
+                    // Move to breakeven if peak was 1x ATR above entry
+                    let peak_pct = (trade.highest_price - trade.entry_price) / trade.entry_price;
+                    let peak_in_atr = if atr > 0.0 { peak_pct / atr } else { 0.0 };
+                    if peak_in_atr >= 1.0 && trade.server_stop_price < trade.entry_price * 0.999 {
+                        let new_stop = trade.entry_price;
+                        (
+                            trade.kraken_pair.clone(),
+                            trade.amount,
+                            new_stop,
+                            trade.stop_loss_order_txid.clone(),
+                        )
+                    } else {
+                        continue;
+                    }
+                } else {
+                    // RSI extreme: tighten further
+                    let trail_mult = if let Some(&rsi) = rsis.get(&pair) {
+                        if rsi > self.config.rsi_overbought {
+                            trail_mult.min(0.75)
+                        } else {
+                            trail_mult
+                        }
+                    } else {
+                        trail_mult
+                    };
+
+                    let trail_pct = (atr * trail_mult).clamp(0.01, 0.10);
+                    let new_stop = trade.highest_price * (1.0 - trail_pct);
+                    let hard_stop = trade.entry_price
+                        * (1.0 - (atr * self.config.hard_sl_atr_mult).clamp(0.03, 0.15));
+                    let new_stop = new_stop.max(hard_stop);
+
+                    if new_stop <= trade.server_stop_price * 1.005 {
+                        continue;
+                    }
+
+                    (
+                        trade.kraken_pair.clone(),
+                        trade.amount,
+                        new_stop,
+                        trade.stop_loss_order_txid.clone(),
+                    )
+                }
+            };
+
+            if let Some(ref txid) = old_txid {
+                if let Err(e) = self.cancel_order(txid).await {
+                    log::warn!("Cancel old SL for {}: {}", pair, e);
+                    continue;
+                }
+            }
+
+            match self.place_stop_loss(&kraken_pair, amount, new_stop).await {
+                Ok(txid) => {
+                    if let Some(trade) = self.open_trades.get_mut(&pair) {
+                        log::info!("SL update {}: {:.6} → {:.6} ({})", pair, trade.server_stop_price, new_stop, txid);
+                        trade.stop_loss_order_txid = Some(txid);
+                        trade.server_stop_price = new_stop;
+                    }
+                }
+                Err(e) => {
+                    log::error!("SL update failed for {}: {}", pair, e);
+                    if let Some((txid, sl_price)) = self.find_sl_order_for_pair(&kraken_pair).await {
+                        log::info!("Re-adopted SL for {}: {:.6} ({})", pair, sl_price, txid);
+                        if let Some(trade) = self.open_trades.get_mut(&pair) {
+                            trade.stop_loss_order_txid = Some(txid);
+                            trade.server_stop_price = sl_price;
+                        }
+                    } else if let Some(trade) = self.open_trades.get_mut(&pair) {
+                        trade.stop_loss_order_txid = None;
+                        trade.server_stop_price = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn log_status_ws(&self) {
+        let open_value: f64 = {
+            let mut total = 0.0;
+            for t in self.open_trades.values() {
+                let price = self.get_ws_price(&t.pair).await.unwrap_or(t.entry_price);
+                total += t.amount * price;
+            }
+            total
+        };
 
         log::info!(
-            "=== Tick #{} | Cash: €{:.2} | Positions: €{:.2} | Total: €{:.2} | Day P&L: €{:.2} | Open: {}/{} ===",
-            self.tick_count,
+            "=== Status | Cash: €{:.2} | Positions: €{:.2} | Total: €{:.2} | Day P&L: €{:.2} | Open: {}/{} ===",
             self.eur_balance,
             open_value,
             self.eur_balance + open_value,
@@ -700,16 +1020,8 @@ impl TradingEngine {
         );
 
         for trade in self.open_trades.values() {
-            let price = self
-                .indicators
-                .get(&trade.pair)
-                .and_then(|i| i.last_price())
-                .unwrap_or(trade.entry_price);
-            let rsi = self
-                .indicators
-                .get(&trade.pair)
-                .and_then(|i| i.rsi(RSI_PERIOD))
-                .unwrap_or(0.0);
+            let price = self.get_ws_price(&trade.pair).await.unwrap_or(trade.entry_price);
+            let rsi = self.get_ws_rsi(&trade.pair).await.unwrap_or(0.0);
             log::info!(
                 "  {} | {:.1}% (€{:.2}) | RSI={:.0} | age={}m | SL={:.6}",
                 trade.pair,
@@ -720,19 +1032,6 @@ impl TradingEngine {
                 trade.server_stop_price,
             );
         }
-
-        if self.liquid_pairs.len() > 0 {
-            let sample: Vec<String> = self
-                .liquid_pairs
-                .iter()
-                .take(5)
-                .filter_map(|(name, _, _)| {
-                    let ind = self.indicators.get(name)?;
-                    let rsi = ind.rsi(RSI_PERIOD)?;
-                    Some(format!("{}={:.0}", name.replace("/EUR", ""), rsi))
-                })
-                .collect();
-            log::info!("  Top RSI: {}", sample.join(" | "));
-        }
     }
+
 }
