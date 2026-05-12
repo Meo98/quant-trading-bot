@@ -59,7 +59,7 @@ impl KrakenRestClient {
     fn get_nonce() -> String {
         let start = SystemTime::now();
         let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-        let nonce = since_the_epoch.as_millis() as u64;
+        let nonce = since_the_epoch.as_micros() as u64;
         nonce.to_string()
     }
 
