@@ -12,11 +12,12 @@ mod config;
 mod trading;
 
 use api::ws_client::KrakenWsClient;
+use api::ws_private::KrakenWsPrivate;
 use config::BotConfig;
 use trading::engine::TradingEngine;
 use trading::shared_state::new_shared_indicators;
 use trading::signal::SignalEngine;
-use trading::types::{Timeframe, TradeSignal};
+use trading::types::{ExecutionEvent, Timeframe, TradeSignal};
 
 #[derive(Debug, Deserialize)]
 struct ExchangeConfig {
@@ -38,6 +39,7 @@ fn default_max_trades() -> usize {
 const EXIT_CHECK_INTERVAL: u64 = 10;
 const BALANCE_INTERVAL: u64 = 60;
 const STATUS_INTERVAL: u64 = 300;
+const DEADMAN_INTERVAL: u64 = 60;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,8 +62,8 @@ async fn main() -> Result<()> {
 
     log::info!("=== Matrix Quant Core v3.1 ===");
     log::info!("Strategy: Chandelier Trailing + ADX Filter + Confluence ≥4.0");
-    log::info!("Exit-check: {}s | Balance: {}s | Status: {}s",
-        EXIT_CHECK_INTERVAL, BALANCE_INTERVAL, STATUS_INTERVAL);
+    log::info!("Exit-check: {}s | Balance: {}s | Status: {}s | Deadman: {}s",
+        EXIT_CHECK_INTERVAL, BALANCE_INTERVAL, STATUS_INTERVAL, DEADMAN_INTERVAL);
 
     let config_path = find_config()?;
     let config_str = fs::read_to_string(&config_path)?;
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
 
     let (market_tx, market_rx) = mpsc::channel(10000);
     let (signal_tx, mut signal_rx) = mpsc::channel::<TradeSignal>(100);
+    let (exec_tx, mut exec_rx) = mpsc::channel::<ExecutionEvent>(100);
 
     let mut signal_engine = SignalEngine::new(market_rx, signal_tx, shared.clone(), pair_map);
 
@@ -149,17 +152,26 @@ async fn main() -> Result<()> {
     log::info!("Preload complete: {} datasets loaded ({} errors)", loaded, errors);
 
     let ws_client = KrakenWsClient::new(ws_symbols, market_tx);
+    let ws_private = KrakenWsPrivate::new(engine.api.clone(), exec_tx);
     tokio::spawn(async move { ws_client.run().await });
+    tokio::spawn(async move { ws_private.run().await });
     tokio::spawn(async move { signal_engine.run().await });
 
-    log::info!("All tasks spawned — waiting for signals...");
+    engine.deadman_heartbeat().await;
+    log::info!("All tasks spawned — deadman switch armed (90s), waiting for signals...");
 
     let mut last_exit_check = 0u64;
     let mut last_balance = 0u64;
     let mut last_status = 0u64;
+    let mut last_deadman = 0u64;
 
     loop {
         tokio::select! {
+            exec = exec_rx.recv() => {
+                if let Some(event) = exec {
+                    engine.handle_execution(&event);
+                }
+            }
             signal = signal_rx.recv() => {
                 match signal {
                     Some(sig) => {
@@ -215,6 +227,11 @@ async fn main() -> Result<()> {
                     last_status = now;
                     engine.tick_count += 1;
                     engine.log_status_ws().await;
+                }
+
+                if now - last_deadman >= DEADMAN_INTERVAL {
+                    last_deadman = now;
+                    engine.deadman_heartbeat().await;
                 }
             }
         }

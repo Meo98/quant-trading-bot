@@ -95,6 +95,19 @@ pub struct Candle {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutionEvent {
+    pub order_id: String,
+    pub exec_type: String,
+    pub symbol: String,
+    pub side: String,
+    pub avg_price: f64,
+    pub cum_qty: f64,
+    pub fee: f64,
+    pub ord_status: String,
+    pub order_type: String,
+}
+
 pub const STABLECOINS: &[&str] = &[
     "USDT/EUR", "USDC/EUR", "DAI/EUR", "PYUSD/EUR", "FDUSD/EUR",
     "TUSD/EUR", "BUSD/EUR", "GUSD/EUR", "USDP/EUR", "EURT/EUR",

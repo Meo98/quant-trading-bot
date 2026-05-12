@@ -2,7 +2,7 @@ use crate::api::rest_client::KrakenRestClient;
 use crate::config::BotConfig;
 use crate::trading::indicators::{Indicators, PriceBar};
 use crate::trading::shared_state::SharedIndicators;
-use crate::trading::types::{Candle, TradeSignal};
+use crate::trading::types::{Candle, ExecutionEvent, TradeSignal};
 use crate::trading::OpenTrade;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -608,11 +608,76 @@ impl TradingEngine {
             .ok_or_else(|| anyhow!("No txid in response: {:?}", result))
     }
 
+    async fn edit_stop_loss(
+        &self,
+        old_txid: &str,
+        kraken_pair: &str,
+        new_stop_price: f64,
+    ) -> Result<String> {
+        let result = self
+            .api
+            .private_request(
+                "/0/private/EditOrder",
+                vec![
+                    ("txid", old_txid.to_string()),
+                    ("pair", kraken_pair.to_string()),
+                    ("price", self.format_price(kraken_pair, new_stop_price)),
+                ],
+            )
+            .await?;
+
+        result
+            .get("txid")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("No txid in EditOrder response: {:?}", result))
+    }
+
     async fn cancel_order(&self, txid: &str) -> Result<()> {
         self.api
             .private_request("/0/private/CancelOrder", vec![("txid", txid.to_string())])
             .await?;
         Ok(())
+    }
+
+    pub async fn deadman_heartbeat(&self) {
+        match self
+            .api
+            .private_request(
+                "/0/private/CancelAllOrdersAfter",
+                vec![("timeout", "90".to_string())],
+            )
+            .await
+        {
+            Ok(_) => log::debug!("Deadman heartbeat sent (90s)"),
+            Err(e) => log::warn!("Deadman heartbeat failed: {}", e),
+        }
+    }
+
+    pub fn handle_execution(&mut self, event: &ExecutionEvent) {
+        if event.side == "sell" && event.order_type == "stop-loss"
+            && (event.ord_status == "filled" || event.exec_type == "trade")
+        {
+            let mut removed_pair = None;
+            for (pair, trade) in &self.open_trades {
+                if let Some(ref txid) = trade.stop_loss_order_txid {
+                    if txid == &event.order_id {
+                        let pnl = trade.amount * event.avg_price - trade.stake_eur;
+                        log::info!(
+                            "SL TRIGGERED {} via WS | fill={:.6} qty={:.6} fee={:.4} | P&L: €{:.2}",
+                            pair, event.avg_price, event.cum_qty, event.fee, pnl
+                        );
+                        self.daily_pnl += pnl;
+                        removed_pair = Some(pair.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(pair) = removed_pair {
+                self.open_trades.remove(&pair);
+                self.cooldowns.insert(pair, Self::now_sec() + 3600);
+            }
+        }
     }
 
     pub async fn update_peaks(&mut self) {
@@ -968,16 +1033,26 @@ impl TradingEngine {
             };
 
             if let Some(ref txid) = old_txid {
-                if let Err(e) = self.cancel_order(txid).await {
-                    log::warn!("Cancel old SL for {}: {}", pair, e);
-                    continue;
+                match self.edit_stop_loss(txid, &kraken_pair, new_stop).await {
+                    Ok(new_txid) => {
+                        if let Some(trade) = self.open_trades.get_mut(&pair) {
+                            log::info!("SL edit {}: {:.6} → {:.6} ({})", pair, trade.server_stop_price, new_stop, new_txid);
+                            trade.stop_loss_order_txid = Some(new_txid);
+                            trade.server_stop_price = new_stop;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("EditOrder failed for {}: {} — falling back to cancel+place", pair, e);
+                        let _ = self.cancel_order(txid).await;
+                    }
                 }
             }
 
             match self.place_stop_loss(&kraken_pair, amount, new_stop).await {
                 Ok(txid) => {
                     if let Some(trade) = self.open_trades.get_mut(&pair) {
-                        log::info!("SL update {}: {:.6} → {:.6} ({})", pair, trade.server_stop_price, new_stop, txid);
+                        log::info!("SL placed {}: {:.6} → {:.6} ({})", pair, trade.server_stop_price, new_stop, txid);
                         trade.stop_loss_order_txid = Some(txid);
                         trade.server_stop_price = new_stop;
                     }
