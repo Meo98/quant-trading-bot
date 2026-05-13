@@ -60,12 +60,10 @@ impl Indicators {
         }
 
         let p = period as f64;
-        let first_end = if end > period * 2 { end - period } else { period + 1 };
-        let start = first_end - period;
 
         let mut avg_gain = 0.0;
         let mut avg_loss = 0.0;
-        for i in (start + 1)..=first_end.min(end) {
+        for i in 1..=period {
             let change = self.bars[i].close - self.bars[i - 1].close;
             if change > 0.0 {
                 avg_gain += change;
@@ -76,7 +74,7 @@ impl Indicators {
         avg_gain /= p;
         avg_loss /= p;
 
-        for i in (first_end + 1)..end {
+        for i in (period + 1)..end {
             let change = self.bars[i].close - self.bars[i - 1].close;
             let (gain, loss) = if change > 0.0 {
                 (change, 0.0)
