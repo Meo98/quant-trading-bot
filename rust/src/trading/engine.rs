@@ -399,9 +399,11 @@ impl TradingEngine {
 
     pub fn reset_daily_if_needed(&mut self) {
         let now = Self::now_sec();
+        let total_balance = self.eur_balance
+            + self.open_trades.values().map(|t| t.stake_eur).sum::<f64>();
+
+        // 1. Regular daily reset (24h elapsed)
         if now - self.last_daily_reset >= 86400 {
-            let total_balance = self.eur_balance
-                + self.open_trades.values().map(|t| t.stake_eur).sum::<f64>();
             log::info!(
                 "Daily reset | Previous: €{:.2} → Now: €{:.2} | Day P&L: {:.2}",
                 self.daily_start_balance,
@@ -411,6 +413,27 @@ impl TradingEngine {
             self.daily_start_balance = total_balance.max(self.eur_balance);
             self.daily_pnl = 0.0;
             self.last_daily_reset = now;
+            return;
+        }
+
+        // 2. Deposit/withdrawal detection: total_balance moved more than
+        //    daily_pnl can account for. Rebases so daily-drawdown limit
+        //    stays meaningful after capital changes. Threshold is the
+        //    larger of €20 absolute or 10% of current total — small enough
+        //    to catch real deposits, large enough to ignore ghost-position
+        //    adjustments and price drift between fetch_balance ticks.
+        let expected = self.daily_start_balance + self.daily_pnl;
+        let unexplained = total_balance - expected;
+        let threshold = (total_balance * 0.10).max(20.0);
+
+        if unexplained.abs() > threshold {
+            log::info!(
+                "Deposit/withdrawal detected: total €{:.2} vs expected €{:.2} \
+                 (delta {:+.2}, threshold €{:.2}) — rebasing daily_start_balance",
+                total_balance, expected, unexplained, threshold
+            );
+            self.daily_start_balance = total_balance.max(self.eur_balance);
+            self.daily_pnl = 0.0;
         }
     }
 
