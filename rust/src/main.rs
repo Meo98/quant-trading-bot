@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -164,15 +165,33 @@ async fn main() -> Result<()> {
     let mut last_balance = 0u64;
     let mut last_status = 0u64;
     let mut last_deadman = 0u64;
+    let mut signal_alive = true;
+    let mut exec_alive = true;
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
 
     loop {
         tokio::select! {
-            exec = exec_rx.recv() => {
-                if let Some(event) = exec {
-                    engine.handle_execution(&event);
+            _ = sigterm.recv() => {
+                log::info!("SIGTERM received — graceful shutdown");
+                break;
+            }
+            _ = sigint.recv() => {
+                log::info!("SIGINT received — graceful shutdown");
+                break;
+            }
+            exec = exec_rx.recv(), if exec_alive => {
+                match exec {
+                    Some(event) => engine.handle_execution(&event),
+                    None => {
+                        log::error!("Execution channel closed — WS-Private dead. \
+                            Exits/balance/deadman continue, but SL-fill events won't auto-clean trades.");
+                        exec_alive = false;
+                    }
                 }
             }
-            signal = signal_rx.recv() => {
+            signal = signal_rx.recv(), if signal_alive => {
                 match signal {
                     Some(sig) => {
                         log::info!("Received signal: {} | strength={:.1} | {:?}",
@@ -189,8 +208,10 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => {
-                        log::error!("Signal channel closed — restarting");
-                        break;
+                        log::error!("Signal channel closed — no new entries will be opened. \
+                            Existing positions still managed (exits, trail, deadman). \
+                            Restart daemon to restore signal flow.");
+                        signal_alive = false;
                     }
                 }
             }

@@ -39,8 +39,8 @@ impl Default for BotConfig {
             rsi_oversold: 30.0,
             rsi_overbought: 80.0,
             hard_sl_atr_mult: 2.0,
-            trail_atr_mult: 1.5,
-            max_hold_minutes: 360,
+            trail_atr_mult: 1.0,
+            max_hold_minutes: 120,
             max_daily_drawdown: 0.05,
         }
     }

@@ -15,7 +15,7 @@ const MIN_CANDLES: usize = 30;
 const BREAKOUT_LOOKBACK: usize = 20;
 const BREAKOUT_VOL_MULT: f64 = 1.5;
 const IMBALANCE_THRESHOLD: f64 = 1.5;
-const MIN_CONFLUENCE_SCORE: f64 = 4.0;
+const MIN_CONFLUENCE_SCORE: f64 = 5.0;
 const ADX_PERIOD: usize = 14;
 const MIN_ADX: f64 = 25.0;
 

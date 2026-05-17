@@ -640,6 +640,29 @@ impl TradingEngine {
         Ok(())
     }
 
+    /// Returns (vol_executed, cost) — the actually filled volume and EUR cost.
+    /// Used to reconcile partial fills against requested order size.
+    async fn query_order_fill(&self, txid: &str) -> Result<(f64, f64)> {
+        let result = self
+            .api
+            .private_request("/0/private/QueryOrders", vec![("txid", txid.to_string())])
+            .await?;
+        let order = result
+            .get(txid)
+            .ok_or_else(|| anyhow!("order {} not in QueryOrders response", txid))?;
+        let vol_exec = order
+            .get("vol_exec")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .ok_or_else(|| anyhow!("no vol_exec field"))?;
+        let cost = order
+            .get("cost")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .ok_or_else(|| anyhow!("no cost field"))?;
+        Ok((vol_exec, cost))
+    }
+
     pub async fn deadman_heartbeat(&self) {
         match self
             .api
@@ -791,16 +814,53 @@ impl TradingEngine {
                     signal.atr_pct * 100.0, signal.components, resp
                 );
 
-                let hard_sl_price = signal.price
+                // Reconcile against actual fill (partial-fill safe). Falls back
+                // to requested values if QueryOrders fails — we still want the
+                // trade tracked even if reconciliation isn't possible.
+                let buy_txid = resp
+                    .get("txid")
+                    .and_then(|t| t.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let (actual_amount, actual_stake, actual_price) = if let Some(ref txid) = buy_txid {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    match self.query_order_fill(txid).await {
+                        Ok((vol, cost)) if vol > 0.0 => {
+                            let avg_price = cost / vol;
+                            if (vol - amount).abs() > amount * 0.02 {
+                                log::warn!(
+                                    "PARTIAL FILL {}: requested {:.6} got {:.6} ({:.1}%) | cost €{:.2} vs €{:.2}",
+                                    signal.pair, amount, vol, vol / amount * 100.0, cost, stake
+                                );
+                            }
+                            (vol, cost, avg_price)
+                        }
+                        Ok(_) => {
+                            log::warn!("QueryOrders {}: zero vol_exec, using requested", signal.pair);
+                            (amount, stake, signal.price)
+                        }
+                        Err(e) => {
+                            log::warn!("QueryOrders {} failed: {} — using requested values", signal.pair, e);
+                            (amount, stake, signal.price)
+                        }
+                    }
+                } else {
+                    log::warn!("BUY {}: no txid in response — using requested values", signal.pair);
+                    (amount, stake, signal.price)
+                };
+
+                let hard_sl_price = actual_price
                     * (1.0 - (signal.atr_pct * self.config.hard_sl_atr_mult).clamp(0.03, 0.20));
 
                 let mut trade = OpenTrade {
                     pair: signal.pair.clone(),
                     kraken_pair: signal.kraken_pair.clone(),
-                    entry_price: signal.price,
-                    amount,
-                    stake_eur: stake,
-                    highest_price: signal.price,
+                    entry_price: actual_price,
+                    amount: actual_amount,
+                    stake_eur: actual_stake,
+                    highest_price: actual_price,
                     entry_time: now,
                     stop_loss_order_txid: None,
                     server_stop_price: 0.0,
@@ -811,7 +871,7 @@ impl TradingEngine {
                 let mut sl_placed = false;
                 for attempt in 0..2 {
                     match self
-                        .place_stop_loss(&signal.kraken_pair, amount, hard_sl_price)
+                        .place_stop_loss(&signal.kraken_pair, actual_amount, hard_sl_price)
                         .await
                     {
                         Ok(txid) => {
@@ -830,11 +890,11 @@ impl TradingEngine {
                     }
                 }
                 if !sl_placed {
-                    log::error!("CRITICAL: {} has NO stop-loss protection!", signal.pair);
+                    log::error!("CRITICAL: {} has NO stop-loss protection! Recovery will retry in trail loop.", signal.pair);
                 }
 
                 self.open_trades.insert(signal.pair.clone(), trade);
-                self.eur_balance -= stake;
+                self.eur_balance -= actual_stake;
                 self.cooldowns.insert(signal.pair.clone(), now + 3600);
                 Ok(true)
             }
@@ -909,11 +969,11 @@ impl TradingEngine {
                 continue;
             }
 
-            // 3. Progressive Chandelier trailing stop
+            // 3. Progressive Chandelier trailing stop (tighter at higher profits)
             let trail_mult = if profit_in_atr >= 3.0 {
-                1.0
+                0.5
             } else if profit_in_atr >= 2.0 {
-                1.25
+                0.75
             } else if profit_in_atr >= 1.0 {
                 self.config.trail_atr_mult
             } else {
@@ -923,7 +983,7 @@ impl TradingEngine {
             // RSI extreme: tighten trail further
             let trail_mult = if let Some(&rsi) = rsis.get(&pair) {
                 if rsi > self.config.rsi_overbought && trail_mult > 0.0 {
-                    trail_mult.min(0.75)
+                    trail_mult.min(0.5)
                 } else {
                     trail_mult
                 }
@@ -960,6 +1020,59 @@ impl TradingEngine {
         let pairs: Vec<String> = self.open_trades.keys().cloned().collect();
 
         for pair in pairs {
+            // SL recovery for trades without a tracked stop-loss. Three-step
+            // atomic strategy: (1) adopt any orphaned SL already on the book
+            // for this pair, (2) if none, cancel stale pair-orders that may be
+            // reserving volume and blocking placement, (3) place a fresh SL.
+            let initial_sl_data = match self.open_trades.get(&pair) {
+                Some(t) if t.stop_loss_order_txid.is_none() => {
+                    let hs = t.entry_price
+                        * (1.0
+                            - (t.entry_atr * self.config.hard_sl_atr_mult).clamp(0.03, 0.20));
+                    Some((t.kraken_pair.clone(), t.amount, hs))
+                }
+                Some(_) => None,
+                None => continue,
+            };
+
+            if let Some((kraken_pair, amount, hard_stop)) = initial_sl_data {
+                // Step 1: adopt orphaned SL (free, safe — no API mutation)
+                if let Some((txid, sl_price)) = self.find_sl_order_for_pair(&kraken_pair).await {
+                    log::warn!(
+                        "SL recovery: adopted orphaned SL for {}: {:.6} ({})",
+                        pair, sl_price, txid
+                    );
+                    if let Some(trade) = self.open_trades.get_mut(&pair) {
+                        trade.stop_loss_order_txid = Some(txid);
+                        trade.server_stop_price = sl_price;
+                    }
+                    continue;
+                }
+
+                // Step 2: nothing to adopt — clear any stale pair orders that
+                // may be reserving the asset and causing "Insufficient funds"
+                self.cancel_open_orders_for_pair(&kraken_pair).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                // Step 3: place fresh SL
+                match self.place_stop_loss(&kraken_pair, amount, hard_stop).await {
+                    Ok(txid) => {
+                        log::warn!(
+                            "SL recovery: placed missing SL for {}: {:.6} ({})",
+                            pair, hard_stop, txid
+                        );
+                        if let Some(trade) = self.open_trades.get_mut(&pair) {
+                            trade.stop_loss_order_txid = Some(txid);
+                            trade.server_stop_price = hard_stop;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("SL recovery: still failing for {}: {}", pair, e);
+                    }
+                }
+                continue;
+            }
+
             let (kraken_pair, amount, new_stop, old_txid) = {
                 let trade = match self.open_trades.get(&pair) {
                     Some(t) => t,
@@ -977,9 +1090,9 @@ impl TradingEngine {
 
                 // Progressive trail: tighter as profit grows
                 let trail_mult = if profit_in_atr >= 3.0 {
-                    1.0
+                    0.5
                 } else if profit_in_atr >= 2.0 {
-                    1.25
+                    0.75
                 } else if profit_in_atr >= 1.0 {
                     self.config.trail_atr_mult
                 } else {
@@ -1005,7 +1118,7 @@ impl TradingEngine {
                     // RSI extreme: tighten further
                     let trail_mult = if let Some(&rsi) = rsis.get(&pair) {
                         if rsi > self.config.rsi_overbought {
-                            trail_mult.min(0.75)
+                            trail_mult.min(0.5)
                         } else {
                             trail_mult
                         }
