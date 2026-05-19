@@ -55,11 +55,21 @@ impl KrakenRestClient {
         Ok(Base64.encode(hmac_result))
     }
 
-    /// Helper to get current nonce
+    /// Helper to get current nonce.
+    ///
+    /// Uses nanoseconds since UNIX epoch. Kraken requires nonces to be strictly
+    /// monotonically increasing per API key. A previous diagnostic curl session
+    /// (2026-05-19) used nanosecond nonces, poisoning the key's last-nonce
+    /// counter ~1000x above what microseconds would produce. To restore the
+    /// bot's ability to call the API, we match that resolution.
+    ///
+    /// u64 fits nanoseconds since epoch until ~2554 — safe for the foreseeable
+    /// future. as_nanos() returns u128 but we narrow to u64 because Kraken
+    /// expects an integer string.
     fn get_nonce() -> String {
         let start = SystemTime::now();
         let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-        let nonce = since_the_epoch.as_micros() as u64;
+        let nonce = since_the_epoch.as_nanos() as u64;
         nonce.to_string()
     }
 

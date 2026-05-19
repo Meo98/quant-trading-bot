@@ -28,6 +28,10 @@ pub struct TradingEngine {
     pub indicators: HashMap<String, Indicators>,
     pub liquid_pairs: Vec<(String, String, f64)>,
     pub cooldowns: HashMap<String, u64>,
+    /// Per-pair rate-limit for SL-recovery attempts in update_trailing_stops_ws.
+    /// Without this, a permanently-broken trade (e.g. balance mismatch) causes
+    /// the recovery to retry every 10s forever, spamming the log and API quota.
+    pub sl_recovery_last_attempt: HashMap<String, u64>,
     pub daily_start_balance: f64,
     pub daily_pnl: f64,
     pub last_daily_reset: u64,
@@ -49,6 +53,7 @@ impl TradingEngine {
             indicators: HashMap::new(),
             liquid_pairs: Vec::new(),
             cooldowns: HashMap::new(),
+            sl_recovery_last_attempt: HashMap::new(),
             daily_start_balance: 0.0,
             daily_pnl: 0.0,
             last_daily_reset: 0,
@@ -125,6 +130,37 @@ impl TradingEngine {
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(0.0);
                 return Some((txid.clone(), price));
+            }
+        }
+        None
+    }
+
+    /// Check if an asset (e.g. "LTC", "XDC") is held in a Kraken Earn allocation.
+    /// Returns Some((strategy_id, amount_allocated)) if yes — useful for emitting
+    /// actionable error messages when "Insufficient funds" is caused by Earn lock
+    /// rather than open orders. The bot CANNOT deallocate via API for
+    /// `opt_in_rewards` strategies; user must use the Kraken web UI.
+    async fn check_earn_allocation(&self, asset_symbol: &str) -> Option<(String, f64)> {
+        let result = self
+            .api
+            .private_request("/0/private/Earn/Allocations", vec![])
+            .await
+            .ok()?;
+        let items = result.get("items")?.as_array()?;
+        for item in items {
+            let asset = item.get("native_asset")?.as_str()?;
+            if asset.eq_ignore_ascii_case(asset_symbol) {
+                let strategy = item.get("strategy_id")?.as_str()?.to_string();
+                let amount: f64 = item
+                    .get("amount_allocated")?
+                    .get("total")?
+                    .get("native")?
+                    .as_str()?
+                    .parse()
+                    .ok()?;
+                if amount > 0.0001 {
+                    return Some((strategy, amount));
+                }
             }
         }
         None
@@ -526,12 +562,29 @@ impl TradingEngine {
 
 
 
+    /// Sends a market-sell for the given trade. Extracted into a helper so the
+    /// retry path in execute_sell doesn't have to duplicate the request.
+    async fn send_market_sell(&self, trade: &OpenTrade) -> Result<Value> {
+        self.api
+            .private_request(
+                "/0/private/AddOrder",
+                vec![
+                    ("pair", trade.kraken_pair.clone()),
+                    ("type", "sell".to_string()),
+                    ("ordertype", "market".to_string()),
+                    ("volume", format!("{:.8}", trade.amount)),
+                ],
+            )
+            .await
+    }
+
     pub async fn execute_sell(&mut self, pair: &str, reason: &str) -> Result<bool> {
         let trade = match self.open_trades.get(pair) {
             Some(t) => t.clone(),
             None => return Ok(false),
         };
 
+        // Step 1: cancel any SL order that may be holding the asset.
         if let Some(ref txid) = trade.stop_loss_order_txid {
             match self.cancel_order(txid).await {
                 Ok(_) => log::info!("Cancelled SL {} for {}", txid, pair),
@@ -546,18 +599,29 @@ impl TradingEngine {
             self.cancel_open_orders_for_pair(&trade.kraken_pair).await;
         }
 
-        let result = self
-            .api
-            .private_request(
-                "/0/private/AddOrder",
-                vec![
-                    ("pair", trade.kraken_pair.clone()),
-                    ("type", "sell".to_string()),
-                    ("ordertype", "market".to_string()),
-                    ("volume", format!("{:.8}", trade.amount)),
-                ],
-            )
-            .await;
+        // Step 2: wait for Kraken to release the asset volume after the cancel.
+        // Without this sleep, the immediately-following AddOrder request races
+        // ahead of Kraken's internal balance update and hits "Insufficient funds"
+        // even though the cancel was accepted. Empirically 800 ms is enough.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // Step 3: market sell.
+        let mut result = self.send_market_sell(&trade).await;
+
+        // Step 4: one full recovery + retry on "Insufficient funds". This covers
+        // the case where there are additional stale orders for the pair (not just
+        // the SL we cancelled), or where 800 ms wasn't enough for some reason.
+        if let Err(ref e) = result {
+            if e.to_string().contains("Insufficient funds") {
+                log::warn!(
+                    "Sell {} got Insufficient funds — broader cancel + 1.5s wait + retry",
+                    pair
+                );
+                self.cancel_open_orders_for_pair(&trade.kraken_pair).await;
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                result = self.send_market_sell(&trade).await;
+            }
+        }
 
         match result {
             Ok(resp) => {
@@ -583,13 +647,34 @@ impl TradingEngine {
             }
             Err(e) => {
                 let msg = e.to_string();
-                log::error!("Sell failed {}: {}", pair, msg);
+                log::error!("Sell failed {} (after retry): {}", pair, msg);
                 if msg.contains("Insufficient funds") {
-                    log::warn!(
-                        "Sell blocked for {} — SL order may be holding asset. \
-                         Ghost check in fetch_balance will verify.",
-                        pair
-                    );
+                    // Most common true cause: asset is held in Kraken Earn
+                    // (opt_in_rewards auto-allocation). Check + give precise
+                    // error so user knows where to look. Then drop the trade
+                    // to break the exit-scan loop (would otherwise retry every
+                    // 10s forever).
+                    let asset_symbol = pair.split('/').next().unwrap_or(pair);
+                    if let Some((strategy_id, amount)) = self.check_earn_allocation(asset_symbol).await {
+                        log::error!(
+                            "CRITICAL: {} is held in Kraken EARN (strategy={}, amount={:.6}). \
+                             Bot cannot deallocate via API (opt_in_rewards strategies block API deallocate). \
+                             FIX: kraken.com → Earn → manually deallocate {}. \
+                             To prevent recurrence: Account Settings → opt out of Opt-In Rewards. \
+                             Dropping trade to free slot.",
+                            pair, strategy_id, amount, asset_symbol
+                        );
+                    } else {
+                        log::error!(
+                            "CRITICAL: {} permanently stuck (not in Earn, no open orders found). \
+                             Check Kraken manually for margin positions or unknown order types. \
+                             Dropping trade to break loop.",
+                            pair
+                        );
+                    }
+                    self.open_trades.remove(pair);
+                    self.cooldowns
+                        .insert(pair.to_string(), Self::now_sec() + 3600);
                 }
                 Err(e)
             }
@@ -1059,6 +1144,20 @@ impl TradingEngine {
             };
 
             if let Some((kraken_pair, amount, hard_stop)) = initial_sl_data {
+                // Rate-limit: don't retry SL recovery for the same pair more often
+                // than every 60s. Without this, a permanently-broken trade (e.g.
+                // Kraken balance mismatch from partial fill, manual intervention,
+                // or asset locked by unknown order) would loop the recovery every
+                // 10s, spamming logs and burning API quota.
+                let now = Self::now_sec();
+                let throttle_seconds = 60u64;
+                if let Some(&last) = self.sl_recovery_last_attempt.get(&pair) {
+                    if now.saturating_sub(last) < throttle_seconds {
+                        continue;
+                    }
+                }
+                self.sl_recovery_last_attempt.insert(pair.clone(), now);
+
                 // Step 1: adopt orphaned SL (free, safe — no API mutation)
                 if let Some((txid, sl_price)) = self.find_sl_order_for_pair(&kraken_pair).await {
                     log::warn!(
@@ -1069,13 +1168,14 @@ impl TradingEngine {
                         trade.stop_loss_order_txid = Some(txid);
                         trade.server_stop_price = sl_price;
                     }
+                    self.sl_recovery_last_attempt.remove(&pair);
                     continue;
                 }
 
                 // Step 2: nothing to adopt — clear any stale pair orders that
                 // may be reserving the asset and causing "Insufficient funds"
                 self.cancel_open_orders_for_pair(&kraken_pair).await;
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
                 // Step 3: place fresh SL
                 match self.place_stop_loss(&kraken_pair, amount, hard_stop).await {
@@ -1088,9 +1188,30 @@ impl TradingEngine {
                             trade.stop_loss_order_txid = Some(txid);
                             trade.server_stop_price = hard_stop;
                         }
+                        self.sl_recovery_last_attempt.remove(&pair);
                     }
                     Err(e) => {
-                        log::warn!("SL recovery: still failing for {}: {}", pair, e);
+                        // Diagnose: if the asset is held in Earn (opt_in_rewards
+                        // auto-allocation), the error will repeat forever until
+                        // user manually deallocates. Log it once with details
+                        // and apply a longer cooldown (1h) to reduce noise.
+                        let asset_symbol = pair.split('/').next().unwrap_or(&pair);
+                        if let Some((strategy_id, amount)) = self.check_earn_allocation(asset_symbol).await {
+                            log::warn!(
+                                "SL recovery {}: failing because asset held in EARN \
+                                 (strategy={}, amount={:.6}). Manual deallocation needed via Kraken web UI. \
+                                 Backing off recovery to 1h until user resolves.",
+                                pair, strategy_id, amount
+                            );
+                            // Override the 60s throttle with a 1h cooldown
+                            self.sl_recovery_last_attempt
+                                .insert(pair.clone(), Self::now_sec() + 3540); // +59m beyond throttle
+                        } else {
+                            log::warn!(
+                                "SL recovery: still failing for {}: {} (next retry in {}s)",
+                                pair, e, throttle_seconds
+                            );
+                        }
                     }
                 }
                 continue;
