@@ -77,6 +77,19 @@ impl TradingEngine {
             .as_secs()
     }
 
+    /// Format a volume safely for Kraken API. Truncates (floors) to 8 decimals
+    /// instead of `{:.8}`'s round-half-up behavior, which can over-shoot the
+    /// actual balance. Real-world hit (2026-05-19): ZEC balance 0.1785369458,
+    /// `format!("{:.8}", x)` produced "0.17853695" → Kraken "Insufficient funds"
+    /// because we asked for 0.0000000042 more than we had.
+    ///
+    /// Applies a 0.999 safety multiplier on top of the floor for extra room —
+    /// loses a tiny fraction of the position but eliminates rounding rejections.
+    fn fmt_volume(volume: f64) -> String {
+        let truncated = (volume * 1e8).floor() / 1e8;
+        format!("{:.8}", truncated * 0.9999)
+    }
+
     pub async fn start(&mut self) -> Result<()> {
         log::info!("Starting engine...");
         self.fetch_eur_pairs().await?;
@@ -243,7 +256,7 @@ impl TradingEngine {
                         ("pair", kraken.clone()),
                         ("type", "sell".to_string()),
                         ("ordertype", "market".to_string()),
-                        ("volume", format!("{:.8}", amount)),
+                        ("volume", Self::fmt_volume(amount)),
                     ],
                 ).await;
                 continue;
@@ -578,7 +591,7 @@ impl TradingEngine {
                     ("pair", trade.kraken_pair.clone()),
                     ("type", "sell".to_string()),
                     ("ordertype", "market".to_string()),
-                    ("volume", format!("{:.8}", trade.amount)),
+                    ("volume", Self::fmt_volume(trade.amount)),
                 ],
             )
             .await
@@ -708,7 +721,7 @@ impl TradingEngine {
                     ("type", "sell".to_string()),
                     ("ordertype", "stop-loss".to_string()),
                     ("price", self.format_price(kraken_pair, stop_price)),
-                    ("volume", format!("{:.8}", volume)),
+                    ("volume", Self::fmt_volume(volume)),
                 ],
             )
             .await?;
@@ -926,7 +939,7 @@ impl TradingEngine {
                     ("pair", signal.kraken_pair.clone()),
                     ("type", "buy".to_string()),
                     ("ordertype", "market".to_string()),
-                    ("volume", format!("{:.8}", amount)),
+                    ("volume", Self::fmt_volume(amount)),
                 ],
             )
             .await;
