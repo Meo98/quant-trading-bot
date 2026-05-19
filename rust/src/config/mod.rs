@@ -26,6 +26,9 @@ pub struct BotConfig {
     pub max_hold_minutes: u64,
     /// Max daily drawdown as fraction of start balance (default: 0.15)
     pub max_daily_drawdown: f64,
+    /// Max trades to open per day. Prevents overtrading on high-noise days
+    /// that would churn through fees. 0 = unlimited.
+    pub max_trades_per_day: u32,
 }
 
 impl Default for BotConfig {
@@ -40,8 +43,15 @@ impl Default for BotConfig {
             rsi_overbought: 80.0,
             hard_sl_atr_mult: 2.0,
             trail_atr_mult: 1.0,
-            max_hold_minutes: 120,
+            // Bumped 120 → 360 on 2026-05-19. The 2h TIME-STOP was killing
+            // slightly-losing trades that would have recovered. New tier-based
+            // TIME-STOP in engine.rs differentiates between clear losers
+            // (-0.5 ATR or worse) at 6h vs anything stagnant at 12h.
+            max_hold_minutes: 360,
             max_daily_drawdown: 0.05,
+            // Allow up to 5 new trades per day. With max_open_trades=3 and
+            // 2-12h holds, 5/day is reasonable selectivity.
+            max_trades_per_day: 5,
         }
     }
 }

@@ -15,7 +15,15 @@ const MIN_CANDLES: usize = 30;
 const BREAKOUT_LOOKBACK: usize = 20;
 const BREAKOUT_VOL_MULT: f64 = 1.5;
 const IMBALANCE_THRESHOLD: f64 = 1.5;
-const MIN_CONFLUENCE_SCORE: f64 = 5.0;
+// Tightened from 5.0 → 6.5 on 2026-05-19. Higher conviction = fewer trades but
+// better fee:edge ratio. On a small (€350) account where round-trip Kraken fees
+// are 0.52% and average winner was €0.06, every fee saved compounds.
+const MIN_CONFLUENCE_SCORE: f64 = 6.5;
+
+// Minimum 5-minute ATR (as fraction of price) required to enter. Below this,
+// volatility is too low for the trade to overcome fees + spread before timing out.
+// 0.30% ATR over 5m ≈ minimum range needed for ~0.5% target trade.
+const MIN_ATR_PCT: f64 = 0.003;
 const ADX_PERIOD: usize = 14;
 const MIN_ADX: f64 = 25.0;
 
@@ -257,6 +265,15 @@ impl SignalEngine {
             Some(p) => p,
             None => return,
         };
+
+        // ATR floor: skip pairs where volatility is too low for a viable trade.
+        // Below MIN_ATR_PCT, expected move is smaller than fees + spread, so any
+        // trade dies by fee-drag before profit.
+        if let Some(atr_pct) = ind_5m.atr_pct(ATR_PERIOD) {
+            if atr_pct < MIN_ATR_PCT {
+                return;
+            }
+        }
 
         // ADX regime filter: only trade when there's a clear trend
         let adx = ind_5m.adx(ADX_PERIOD);

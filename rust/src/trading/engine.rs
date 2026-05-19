@@ -32,6 +32,9 @@ pub struct TradingEngine {
     /// Without this, a permanently-broken trade (e.g. balance mismatch) causes
     /// the recovery to retry every 10s forever, spamming the log and API quota.
     pub sl_recovery_last_attempt: HashMap<String, u64>,
+    /// Number of trades opened so far today. Reset by reset_daily_if_needed.
+    /// Capped by config.max_trades_per_day to prevent fee-burn on noisy days.
+    pub daily_trade_count: u32,
     pub daily_start_balance: f64,
     pub daily_pnl: f64,
     pub last_daily_reset: u64,
@@ -54,6 +57,7 @@ impl TradingEngine {
             liquid_pairs: Vec::new(),
             cooldowns: HashMap::new(),
             sl_recovery_last_attempt: HashMap::new(),
+            daily_trade_count: 0,
             daily_start_balance: 0.0,
             daily_pnl: 0.0,
             last_daily_reset: 0,
@@ -441,13 +445,15 @@ impl TradingEngine {
         // 1. Regular daily reset (24h elapsed)
         if now - self.last_daily_reset >= 86400 {
             log::info!(
-                "Daily reset | Previous: €{:.2} → Now: €{:.2} | Day P&L: {:.2}",
+                "Daily reset | Previous: €{:.2} → Now: €{:.2} | Day P&L: {:.2} | Trades today: {}",
                 self.daily_start_balance,
                 total_balance,
-                self.daily_pnl
+                self.daily_pnl,
+                self.daily_trade_count
             );
             self.daily_start_balance = total_balance.max(self.eur_balance);
             self.daily_pnl = 0.0;
+            self.daily_trade_count = 0;
             self.last_daily_reset = now;
             return;
         }
@@ -885,6 +891,17 @@ impl TradingEngine {
         if !self.is_daily_drawdown_ok() {
             return Ok(false);
         }
+        // Daily trade cap — prevents overtrading on high-noise days where
+        // many false signals would churn through fees. 0 = unlimited.
+        if self.config.max_trades_per_day > 0
+            && self.daily_trade_count >= self.config.max_trades_per_day
+        {
+            log::debug!(
+                "Skip signal {}: daily trade cap reached ({}/{})",
+                signal.pair, self.daily_trade_count, self.config.max_trades_per_day
+            );
+            return Ok(false);
+        }
 
         let now = Self::now_sec();
         if let Some(&cd) = self.cooldowns.get(&signal.pair) {
@@ -1004,6 +1021,7 @@ impl TradingEngine {
                 self.open_trades.insert(signal.pair.clone(), trade);
                 self.eur_balance -= actual_stake;
                 self.cooldowns.insert(signal.pair.clone(), now + 3600);
+                self.daily_trade_count += 1;
                 Ok(true)
             }
             Err(e) => {
@@ -1112,12 +1130,31 @@ impl TradingEngine {
                 }
             }
 
-            // 4. Time stop (6h with no meaningful profit)
-            if age > self.config.max_hold_minutes && profit_in_atr < 1.0 {
-                exits.push((
-                    pair.clone(),
-                    format!("TIME-STOP: {}h {}m | P/L: {:.1}% €{:.2}", age / 60, age % 60, profit * 100.0, profit_eur),
-                ));
+            // 4. Time stop — tier-based to avoid killing slightly-losing trades
+            //    that might recover. Replaces old behavior of killing ANY trade
+            //    < 1.0 ATR profit after max_hold (which was 2h, now 6h).
+            //
+            //    Tier 1 (max_hold_minutes, default 6h):
+            //      Only kill clear losers (worse than -0.5 ATR).
+            //      Stagnant near-entry trades get more time.
+            //
+            //    Tier 2 (2 × max_hold_minutes, 12h):
+            //      Kill anything that's not a clear winner. At this point even
+            //      slightly-positive trades are tying up capital for too little.
+            if age > self.config.max_hold_minutes {
+                let should_exit = if age > self.config.max_hold_minutes * 2 {
+                    // Tier 2: kill stagnant trades to free the slot
+                    profit_in_atr < 1.0
+                } else {
+                    // Tier 1: only kill clear losers
+                    profit_in_atr < -0.5
+                };
+                if should_exit {
+                    exits.push((
+                        pair.clone(),
+                        format!("TIME-STOP: {}h {}m | P/L: {:.1}% €{:.2}", age / 60, age % 60, profit * 100.0, profit_eur),
+                    ));
+                }
             }
         }
 
