@@ -874,6 +874,17 @@ impl TradingEngine {
             return 0.0;
         }
 
+        // Fixed-stake mode: for small accounts (<€1000) where %-of-equity is
+        // dominated by MIN_STAKE_EUR. Kelly-criterion is negative at PF<1
+        // anyway, so signal-strength scaling is theatre. Simple fixed amount
+        // gives consistent risk per trade and lets us measure the strategy
+        // without sizing noise. (Switch back to None and tune BASE_RISK_PCT
+        // once account is >€1000.)
+        if let Some(fixed) = self.config.fixed_stake_eur {
+            let stake = fixed.min(self.eur_balance * 0.95);
+            return if stake >= MIN_STAKE_EUR { stake } else { 0.0 };
+        }
+
         let strength_frac = ((signal.strength - SIGNAL_SCALE_MIN) / (SIGNAL_SCALE_MAX - SIGNAL_SCALE_MIN))
             .clamp(0.0, 1.0);
         let risk_pct = BASE_RISK_PCT + strength_frac * (MAX_RISK_PCT - BASE_RISK_PCT);
@@ -1108,21 +1119,32 @@ impl TradingEngine {
                 continue;
             }
 
-            // 3. Progressive Chandelier trailing stop (tighter at higher profits)
-            let trail_mult = if profit_in_atr >= 3.0 {
-                0.5
-            } else if profit_in_atr >= 2.0 {
-                0.75
-            } else if profit_in_atr >= 1.0 {
-                self.config.trail_atr_mult
+            // 3. Chandelier trailing stop — FLIPPED on 2026-05-19 based on
+            //    research review:
+            //    OLD: 1.0× → 0.75× → 0.5× ATR as profit grew (= killed winners
+            //         at 5m timeframe; single noise candle stopped trades out;
+            //         resulted in €0.06 avg winner vs €0.50 avg loser).
+            //    NEW: base 3.0× ATR (Le Beau default), tighten only after
+            //         significant profit (≥3× ATR) to base/2 = 1.5× (literature
+            //         floor for short-TF crypto), never below trail_atr_min.
+            //    Goal: let winners actually run, fixing the asymmetry that
+            //    makes Profit Factor 0.17 mathematically impossible to escape.
+            let trail_mult = if profit_in_atr >= 1.0 {
+                if profit_in_atr >= 3.0 {
+                    // Significant profit: tighten to half base, but never below floor
+                    (self.config.trail_atr_mult / 2.0).max(self.config.trail_atr_min)
+                } else {
+                    // In profit but not yet huge: full base trail
+                    self.config.trail_atr_mult
+                }
             } else {
                 0.0
             };
 
-            // RSI extreme: tighten trail further
+            // RSI extreme: tighten to floor (never below trail_atr_min)
             let trail_mult = if let Some(&rsi) = rsis.get(&pair) {
                 if rsi > self.config.rsi_overbought && trail_mult > 0.0 {
-                    trail_mult.min(0.5)
+                    trail_mult.min(self.config.trail_atr_min)
                 } else {
                     trail_mult
                 }

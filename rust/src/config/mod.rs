@@ -19,8 +19,16 @@ pub struct BotConfig {
 
     /// Hard stop = entry - (ATR * this multiplier) (default: 2.5)
     pub hard_sl_atr_mult: f64,
-    /// Trailing stop = peak - (ATR * this multiplier) (default: 2.0)
+    /// Trailing stop = peak - (ATR * this multiplier) (default: 2.0).
+    /// This is the BASE — engine.rs may tighten via RSI extremes but never below
+    /// `trail_atr_min`. Le Beau's original Chandelier uses 3.0; literature for
+    /// short-TF crypto recommends 1.5 as minimum floor.
     pub trail_atr_mult: f64,
+    /// Minimum trail multiplier — never tighten trail below this. Prevents the
+    /// 0.5× ATR death-trap (see 2026-05-19 research review: any noise candle
+    /// stops you out at 0.5× ATR on 5m crypto, leading to €0.06 avg winners
+    /// vs. potential 0.5-2% per trade with 1.5× floor).
+    pub trail_atr_min: f64,
 
     /// Max hold time in minutes before time-stop (default: 1440 = 24h)
     pub max_hold_minutes: u64,
@@ -29,6 +37,11 @@ pub struct BotConfig {
     /// Max trades to open per day. Prevents overtrading on high-noise days
     /// that would churn through fees. 0 = unlimited.
     pub max_trades_per_day: u32,
+    /// If Some(€), use this fixed EUR stake per trade instead of %-of-equity.
+    /// Recommended for accounts < €1000 where %-sizing is meaningless due to
+    /// MIN_STAKE constraints (Carver, Tharp et al). With None, falls back to
+    /// the BASE_RISK_PCT / MAX_RISK_PCT signal-strength scaling.
+    pub fixed_stake_eur: Option<f64>,
 }
 
 impl Default for BotConfig {
@@ -42,16 +55,23 @@ impl Default for BotConfig {
             rsi_oversold: 30.0,
             rsi_overbought: 80.0,
             hard_sl_atr_mult: 2.0,
-            trail_atr_mult: 1.0,
-            // Bumped 120 → 360 on 2026-05-19. The 2h TIME-STOP was killing
-            // slightly-losing trades that would have recovered. New tier-based
-            // TIME-STOP in engine.rs differentiates between clear losers
-            // (-0.5 ATR or worse) at 6h vs anything stagnant at 12h.
-            max_hold_minutes: 360,
+            // 1.0 → 3.0 on 2026-05-19. Le Beau's original Chandelier default.
+            // Combined with trail_atr_min=1.5 floor, lets winners actually run
+            // instead of being knocked out by single noise candles.
+            trail_atr_mult: 3.0,
+            trail_atr_min: 1.5,
+            // Bumped 360 → 720 (12h) on 2026-05-19. Longer holds let momentum
+            // unfold; fee/move ratio drops from ~50% (1h hold) to ~10% (12h).
+            max_hold_minutes: 720,
             max_daily_drawdown: 0.05,
-            // Allow up to 5 new trades per day. With max_open_trades=3 and
-            // 2-12h holds, 5/day is reasonable selectivity.
-            max_trades_per_day: 5,
+            // Reduced 5 → 3 on 2026-05-19. With higher selectivity (regime-
+            // aware confluence + 0.5% ATR floor), expect even fewer high-quality
+            // signals. Hard cap prevents overtrading on noisy days.
+            max_trades_per_day: 3,
+            // Fixed €10 stake for small accounts. Kelly-criterion is negative
+            // at PF<1, so %-scaling is theatre. Switch to None and adjust
+            // BASE_RISK_PCT in engine.rs once account exceeds ~€1000.
+            fixed_stake_eur: Some(10.0),
         }
     }
 }

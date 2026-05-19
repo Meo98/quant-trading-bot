@@ -15,15 +15,19 @@ const MIN_CANDLES: usize = 30;
 const BREAKOUT_LOOKBACK: usize = 20;
 const BREAKOUT_VOL_MULT: f64 = 1.5;
 const IMBALANCE_THRESHOLD: f64 = 1.5;
-// Tightened from 5.0 → 6.5 on 2026-05-19. Higher conviction = fewer trades but
-// better fee:edge ratio. On a small (€350) account where round-trip Kraken fees
-// are 0.52% and average winner was €0.06, every fee saved compounds.
+// Regime-aware confluence threshold (added 2026-05-19 from Carver's Ch 7-8).
+// In strong-trend regime (ADX > MIN_CONFLUENCE_SCORE_ADX_STRONG), require less
+// confluence — the trend itself IS a strong signal. In choppy regime, demand
+// more confirmation to avoid noise trades.
 const MIN_CONFLUENCE_SCORE: f64 = 6.5;
+const MIN_CONFLUENCE_SCORE_STRONG_ADX: f64 = 5.5;
+const STRONG_ADX_THRESHOLD: f64 = 35.0;
 
-// Minimum 5-minute ATR (as fraction of price) required to enter. Below this,
-// volatility is too low for the trade to overcome fees + spread before timing out.
-// 0.30% ATR over 5m ≈ minimum range needed for ~0.5% target trade.
-const MIN_ATR_PCT: f64 = 0.003;
+// Minimum 5-minute ATR (as fraction of price) required to enter. Raised
+// 0.003 → 0.005 (0.5%) on 2026-05-19 — research showed 0.3% ATR was below the
+// spot-momentum scalping minimum of 0.35%, leading to trades that died from
+// fee-drag before any profit. 0.5% is a more conservative gate.
+const MIN_ATR_PCT: f64 = 0.005;
 const ADX_PERIOD: usize = 14;
 const MIN_ADX: f64 = 25.0;
 
@@ -365,7 +369,14 @@ impl SignalEngine {
             }
         }
 
-        if score >= MIN_CONFLUENCE_SCORE {
+        // Regime-aware threshold: lower bar when ADX is strong (trend is the
+        // confluence). Otherwise demand the higher 6.5/8 threshold.
+        let required_score = if adx_val >= STRONG_ADX_THRESHOLD {
+            MIN_CONFLUENCE_SCORE_STRONG_ADX
+        } else {
+            MIN_CONFLUENCE_SCORE
+        };
+        if score >= required_score {
             let atr_pct = ind_5m.atr_pct(ATR_PERIOD).unwrap_or(0.02);
 
             log::info!(
